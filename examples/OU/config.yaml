@@ -1,0 +1,39 @@
+seed: 0
+
+dtype: single
+
+#following sFML paper
+
+data:
+    problem_dim: 1
+    memory: 0       # required by resnet; no memory window for SDE
+
+network:
+    depth: 3        # hidden layers
+    width: 20       # neurons per layer
+    activation: "gelu"
+    latent_dim: 8           # dimension of latent noise vector z fed to Generator
+    condition_on_state: true  #Generator takes (x,z), Critic takes (x,r)
+
+training:   # Phase 1 — deterministic ResNet D_theta
+    device: "cpu"
+    valid: 0
+    epochs: 500     
+    batch_size: 256 
+    optimizer: "adam"
+    scheduler: "cosine"
+    learning_rate: 0.001
+    verbose: 50
+    loss: "mse"
+    save_path: "./det_model"
+
+gan:                # Phase 2 — WGAN-GP Generator + Critic
+    epochs: 10000   # CPU constraint, paper uses 100,000; 
+    batch_size: 256 # paper §5.1.1
+    n_critic: 5     # critic steps per generator step (paper §5.1.1)
+    gp_lambda: 10   # gradient penalty weight (paper §5.1.1)
+    learning_rate: 0.00005  # paper §5.1.1: 5e-5
+    adam_beta1: 0.5          # paper §5.1.1
+    adam_beta2: 0.999        # paper §5.1.1
+    verbose: 1000
+    save_path: "./gan_model"
