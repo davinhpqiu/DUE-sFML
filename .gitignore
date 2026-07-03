@@ -6,3 +6,4 @@ __pycache__/
 due_env/
 .DS_Store
 *.mat
+./png

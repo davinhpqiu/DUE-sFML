@@ -13,12 +13,12 @@ network:
     width: 20       # neurons per layer
     activation: "gelu"
     latent_dim: 8           # dimension of latent noise vector z fed to Generator
-    condition_on_state: true  #Generator takes (x,z), Critic takes (x,r)
+    condition_on_state: true  # Generator takes (x,z), Critic takes (x0,y1:L)
 
 training:   # Phase 1 — deterministic ResNet D_theta
     device: "cpu"
     valid: 0
-    epochs: 500     
+    epochs: 250    
     batch_size: 256 
     optimizer: "adam"
     scheduler: "cosine"
@@ -28,12 +28,16 @@ training:   # Phase 1 — deterministic ResNet D_theta
     save_path: "./det_model"
 
 gan:                # Phase 2 — WGAN-GP Generator + Critic
-    epochs: 10000   # CPU constraint, paper uses 100,000; 
-    batch_size: 256 # paper §5.1.1
-    n_critic: 5     # critic steps per generator step (paper §5.1.1)
+    epochs: 1000   # use 100000 for the full paper-scale run
+    batch_size: 1000 # batches are trajectory sequences, not one-step pairs
+    n_critic: 5     # update generator once every 5 critic updates
     gp_lambda: 10   # gradient penalty weight (paper §5.1.1)
     learning_rate: 0.00005  # paper §5.1.1: 5e-5
     adam_beta1: 0.5          # paper §5.1.1
     adam_beta2: 0.999        # paper §5.1.1
-    verbose: 1000
+    verbose: 10
+    checkpoint_interval: 100
+    selection_std_weight: 1.0
+    selection_wgap_weight: 1.0
+    selection_gp_weight: 1.0
     save_path: "./gan_model"

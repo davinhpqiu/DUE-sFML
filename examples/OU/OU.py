@@ -7,7 +7,8 @@ Follows Section 5.1.1 of:
 
 Two-phase training:
   Phase 1: Train deterministic sub-map D_theta (ResNet) via MSE.
-  Phase 2: Train Generator G_phi and Critic C_psi (WGAN-GP) on residuals.
+  Phase 2: Train S_delta and Critic C_psi (WGAN-GP) on full increment
+           sequences (x0, y1:L), following Algorithm 4.1.
 
 Run from examples/OU/ directory:
   python OU.py
@@ -18,6 +19,12 @@ import torch
 import matplotlib.pyplot as plt
 from yaml import safe_load
 from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import due
 
 # Config
@@ -36,23 +43,28 @@ conf_gan["latent_dim"] = conf_net["latent_dim"]
 # Data
 
 data_loader = due.datasets.sde.sde_dataset(conf_data)
-trainX, trainY, test_data, vmin, vmax = data_loader.load(
+trainX, trainY, test_data, vmin, vmax = data_loader.load_sequence(
     "OU_train.mat", "OU_test.mat"
 )
-# trainX, trainY: shape (J, d), normalized to [-1, 1]
+# trainX: shape (N, d), normalized x0
+# trainY: shape (N, d, L), normalized x1,...,xL
 # test_data: shape (N_test, d, T_test+1), raw (unnormalized)
+
+conf_net["sequence_length"] = trainY.shape[-1]
 
 # Phase 1 — Deterministic Sub-map D_theta (ResNet)
 
-# ODE expects trainY with shape (J, d, multi_steps).
-# For single-step prediction, reshape (J, d) -> (J, d, 1).
-trainY_3d = trainY[:, :, np.newaxis]
-
 det_net = due.networks.fcn.resnet(vmin, vmax, conf_net)
-phase1_model = due.models.ODE(trainX, trainY_3d, det_net, conf_train)
+phase1_model = due.models.ODE(trainX, trainY, det_net, conf_train)
 phase1_model.train()
 phase1_model.save_hist()
-# det_net is frozen inside SDE.__init__;
+
+# Use the best deterministic map saved during Phase 1, then freeze it in SDE.__init__.
+det_net = torch.load(
+    conf_train["save_path"] + "/model",
+    map_location=conf_train["device"],
+    weights_only=False,
+)
 
 # Phase 2 — WGAN-GP (Generator + Critic)
 
@@ -66,8 +78,13 @@ sde_model.save_hist()
 # Evaluation
 
 device = conf_train["device"]
-generator = torch.load(conf_gan["save_path"] + "/generator_final", map_location=device, weights_only=False)
-det_net   = torch.load(conf_train["save_path"] + "/model",         map_location=device, weights_only=False)
+generator_path = Path(conf_gan["save_path"]) / "generator_best"
+if not generator_path.exists():
+    generator_path = Path(conf_gan["save_path"]) / "generator_final"
+print("Loading generator from", generator_path)
+
+generator = torch.load(str(generator_path), map_location=device, weights_only=False)
+det_net   = torch.load(conf_train["save_path"] + "/model", map_location=device, weights_only=False)
 generator.eval()
 det_net.eval()
 
