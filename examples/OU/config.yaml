@@ -7,19 +7,20 @@ dtype: single
 data:
     problem_dim: 1
     memory: 0       # required by resnet; no memory window for SDE
+    seq_len: 40     # trajectory length L used in Phase 2 (Algorithm 4.1)
 
 network:
     depth: 3        # hidden layers
     width: 20       # neurons per layer
     activation: "gelu"
-    latent_dim: 8           # dimension of latent noise vector z fed to Generator
+    latent_dim: 1           # dim(z)=dim(x) per GAN paper convention (was 8); OU noise is 1-D
     condition_on_state: true  #Generator takes (x,z), Critic takes (x,r)
 
 training:   # Phase 1 — deterministic ResNet D_theta
     device: "cpu"
     valid: 0
-    epochs: 500     
-    batch_size: 256 
+    epochs: 500     # faithful multi-step (eq 4.11); D_theta needn't be accurate (Remark 4.1). More epochs made the fixed point WORSE (under-constrained), so keep it modest.
+    batch_size: 256
     optimizer: "adam"
     scheduler: "cosine"
     learning_rate: 0.001
@@ -28,12 +29,14 @@ training:   # Phase 1 — deterministic ResNet D_theta
     save_path: "./det_model"
 
 gan:                # Phase 2 — WGAN-GP Generator + Critic
-    epochs: 10000   # CPU constraint, paper uses 100,000; 
-    batch_size: 256 # paper §5.1.1
+    epochs: 1000    # best baseline (~39k updates); batch-1024 test made over-dispersion worse, so reverted
+    batch_size: 256 # reverted to baseline (paper §5.1.1)
     n_critic: 5     # critic steps per generator step (paper §5.1.1)
     gp_lambda: 10   # gradient penalty weight (paper §5.1.1)
     learning_rate: 0.00005  # paper §5.1.1: 5e-5
+    learning_rate_min: 0.00001  # GAN paper: cosine-decay 5e-5 -> 1e-5
+    scheduler: "cosine"         # GAN paper: cosine LR decay (was constant)
     adam_beta1: 0.5          # paper §5.1.1
     adam_beta2: 0.999        # paper §5.1.1
-    verbose: 1000
+    verbose: 200    # ~5 prints over the 1000-epoch run
     save_path: "./gan_model"

@@ -6,3 +6,17 @@ __pycache__/
 due_env/
 .DS_Store
 *.mat
+**/det_model/
+**/gan_model/
+**/model/
+**/prior_model/
+examples/DampedPendulum/
+examples/DampedPendulum_partial/
+examples/DampedPendulum_partial_noise/
+examples/DoubleOscillator/
+examples/Lorenz63/
+examples/RobertsonOSG/
+examples/ViscousBurgers/
+examples/VorticityOSG/
+examples/WakeCylinder/
+tests/

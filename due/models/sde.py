@@ -8,293 +8,284 @@ from ..utils import *
 
 class SDE:
     """
-    Class representing the stochastic flow map learning (sFML) model.
+    Sequence-level WGAN-GP training for sFML (Algorithm 4.1, Chen & Xiu 2024).
 
-    Implements Phase 2 of the sFML framework (Chen & Xiu, 2024):
-    given a frozen deterministic sub-map D_theta,
-    train a Generator G_phi and Critic C_psi via WGAN-GP so that
-    G_phi(x_n, z) approximates draws from the residual distribution p(r | x_n), where r_n = x_{n+1} - D_theta(x_n).
+    Trains Generator G_phi and Critic C_psi on full L-step trajectory sequences,
+    matching the paper exactly:
 
-    The full stochastic prediction at inference time is:
+      - Per training step, the generator is rolled out L steps from x_0 to produce
+        a fake increment sequence ŷ_{1:L} where ŷ_j = x̂_j - x̂_{j-1}.
+      - The critic discriminates (x_0, ŷ_{1:L}) vs (x_0, y_{1:L}) — it sees the
+        full temporal structure, not just single-step pairs.
+      - Gradient penalty is computed in the joint (x_0, y_{1:L}) space.
+
+    At inference time the stochastic map is unchanged:
         x_{n+1} = D_theta(x_n) + G_phi(x_n, z),   z ~ N(0, I)
 
     Args:
-        trainX (numpy array): Normalized input states x_n, shape (J, d).
-        trainY (numpy array): Normalized output states x_{n+1}, shape (J, d).
-        det_net: Trained and frozen deterministic sub-map D_theta (e.g., due.networks.fcn.resnet).
+        train_seqs (numpy array): Normalised trajectory sequences, shape (N, d, L+1).
+            Each sequence contains L+1 time points starting from x_0.
+        det_net: Trained and frozen deterministic sub-map D_theta.
         generator: Generator network G_phi (due.networks.gan.Generator).
         critic: Critic network C_psi (due.networks.gan.Critic).
-        config (dict): Configuration parameters for training.
+        config (dict): Training configuration.
             - device (str): 'cpu' or 'cuda'.
             - epochs (int): Number of training epochs.
-            - batch_size (int): Batch size.
-            - n_critic (int): Number of critic updates per generator update.
-            - gp_lambda (float): Gradient penalty weight.
-            - learning_rate (float): Learning rate for Adam optimizers.
-            - adam_beta1 (float): Adam beta_1 parameter.
-            - adam_beta2 (float): Adam beta_2 parameter.
-            - latent_dim (int): Dimension of the latent noise vector z.
-            - verbose (int): Print frequency (in epochs).
-            - save_path (str): Directory to save the trained model and history.
+            - batch_size (int): Trajectories per batch.
+            - n_critic (int): Critic updates per generator update (paper: 5).
+            - gp_lambda (float): Gradient penalty weight (paper: 10).
+            - learning_rate (float): Adam learning rate (paper: 5e-5).
+            - adam_beta1 (float): Adam beta_1 (paper: 0.5).
+            - adam_beta2 (float): Adam beta_2 (paper: 0.999).
+            - latent_dim (int): Dimension of z ~ N(0, I).
+            - verbose (int): Print every this many epochs.
+            - save_path (str): Directory for saved models and history.
             - seed (int): Random seed.
 
     Attributes:
-        trainX (torch.Tensor): Normalized input states.
-        trainY (torch.Tensor): Normalized output states.
-        residuals (torch.Tensor): Precomputed residuals r_n = x_{n+1} - D_theta(x_n).
-        det_net: Frozen deterministic sub-map.
-        generator: Generator network.
-        critic: Critic network.
-        hist (torch.Tensor): Training history, shape (epochs, 2).
-            Column 0: critic loss per epoch.
-            Column 1: generator loss per epoch.
-
-    Methods:
-        train(): Runs the WGAN-GP training loop.
-        gradient_penalty(x, r_real, r_fake): Computes the gradient penalty term.
-        save_hist(xlog=False, ylog=False): Saves training history to CSV and PNG.
-        summary(): Prints a summary of the model.
-        set_seed(seed): Sets the random seed for reproducibility.
+        x0 (Tensor): Normalised initial states, shape (N, d).
+        y_real (Tensor): Real increment sequences, shape (N, d, L).
+                         y_real[:, :, j] = x_{j+1} - x_j from training data.
+        L (int): Sequence length (number of increments).
+        hist (Tensor): Training history (epochs, 2) — col 0 critic, col 1 generator.
     """
 
-    def __init__(self, trainX, trainY, det_net, generator, critic, config):
+    def __init__(self, train_seqs, det_net, generator, critic, config):
         super().__init__()
 
-        # Seed
         self.set_seed(config["seed"])
         self.device = config["device"]
 
-        # Keep data as CPU tensors; moved to device per-batch inside train()
-        self.trainX = torch.from_numpy(trainX)
-        self.trainY = torch.from_numpy(trainY)
+        # Unpack trajectory dimensions
+        N, d, Lp1 = train_seqs.shape
+        self.L = Lp1 - 1   # number of increment steps
+        self.d = d
 
-        # Freeze D_theta
+        # Convert to tensors (kept on CPU; moved to device per-batch in train())
+        seqs = torch.from_numpy(train_seqs)
+        self.x0     = seqs[:, :, 0]                          # (N, d) initial states
+        self.y_real = seqs[:, :, 1:] - seqs[:, :, :-1]      # (N, d, L) real increments
+
+        # Freeze D_theta — its parameters are never updated during Phase 2
         self.det_net = det_net.to(self.device)
         for param in self.det_net.parameters():
             param.requires_grad = False
         self.det_net.eval()
 
-        # Precompute residuals r_n = x_{n+1} - D_theta(x_n)
-        print("Precomputing residuals r_n = x_{n+1} - D_theta(x_n) ...")
-        with torch.no_grad():
-            X_dev = self.trainX.to(self.device)
-            Y_dev = self.trainY.to(self.device)
-            self.residuals = (Y_dev - self.det_net(X_dev)).cpu()
-        print("Residuals computed. Shape:", self.residuals.shape)
-
-        # Move Generator and Critic to device; weights updated during training
         self.generator = generator.to(self.device)
-        self.critic = critic.to(self.device)
+        self.critic    = critic.to(self.device)
 
-        # hyperparameters from config
-        self.nepochs = config["epochs"] # total training epochs
-        self.bsize = config["batch_size"] # samples per batch
-        self.n_critic = config["n_critic"] # critic steps per generator step (paper: 5)
-        self.gp_lambda = config["gp_lambda"] # weight on gradient penalty term (paper: 10)
-        self.latent_dim = config["latent_dim"] # dimension of z ~ N(0, I)
-        self.verbose = config["verbose"] # print every this many epochs
-        self.save_path = config["save_path"] # directory for saved models and plots
+        # Hyperparameters
+        self.nepochs    = config["epochs"]
+        self.bsize      = config["batch_size"]
+        self.n_critic   = config["n_critic"]
+        self.gp_lambda  = config["gp_lambda"]
+        self.latent_dim = config["latent_dim"]
+        self.verbose    = config["verbose"]
+        self.save_path  = config["save_path"]
 
-        # save directory
         try:
             os.mkdir(self.save_path)
         except:
             pass
 
-        # Optimisers
-        # Separate Adam instances for Generator and Critic
-
-        lr = config["learning_rate"]
+        lr    = config["learning_rate"]
         beta1 = config["adam_beta1"]
         beta2 = config["adam_beta2"]
         self.opt_G = torch.optim.Adam(self.generator.parameters(), lr=lr, betas=(beta1, beta2))
-        self.opt_C = torch.optim.Adam(self.critic.parameters(), lr=lr, betas=(beta1, beta2))
+        self.opt_C = torch.optim.Adam(self.critic.parameters(),    lr=lr, betas=(beta1, beta2))
 
-        # Pre-allocate history: (epochs, 2) — col 0 = critic loss, col 1 = generator loss
+        # Learning-rate schedule. The GAN paper (Chen & Xiu 2022) decays lr from
+        # 5e-5 to 1e-5 with cosine annealing; sFML inherits this. Applied per epoch
+        # to both optimizers. Default lr_min = lr/5 reproduces 5e-5 -> 1e-5.
+        self.sched_type = config.get("scheduler", "cosine")
+        lr_min = float(config.get("learning_rate_min", lr / 5.0))
+        if self.sched_type == "cosine":
+            self.sched_G = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.opt_G, T_max=self.nepochs, eta_min=lr_min)
+            self.sched_C = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.opt_C, T_max=self.nepochs, eta_min=lr_min)
+        else:
+            self.sched_G = self.sched_C = None
+        self.lr_min = lr_min
+
+        # History: col 0 = critic loss, col 1 = generator loss
         self.hist = torch.zeros(self.nepochs, 2)
 
-        # DataLoader 
-        # TensorDataset zips (x_n, r_n) matched pairs.
-        # shuffle=True re-randomises order each epoch
-        # drop_last=True discards final incomplete batch
-        dataset = torch.utils.data.TensorDataset(self.trainX, self.residuals)
+        # DataLoader over trajectories — each item is (x0, y_real) for one trajectory
+        dataset = torch.utils.data.TensorDataset(self.x0, self.y_real)
         self.train_loader = torch.utils.data.DataLoader(
             dataset, batch_size=self.bsize, shuffle=True, drop_last=True
         )
 
-    def gradient_penalty(self, x, r_real, r_fake):
+    def _rollout(self, x0_batch):
         """
-        Computes the WGAN-GP gradient penalty.
+        Roll out the stochastic map L steps from x0 (Algorithm 4.1, lines 5-8).
 
-        Interpolates between real and fake residuals, evaluates the critic,
-        penalises deviation of the gradient norm from 1.
+        At each step j:
+            z_j      ~ N(0, I)
+            x̂_{j+1}  = D_theta(x̂_j) + G_phi(x̂_j, z_j)
+            ŷ_{j+1}  = x̂_{j+1} - x̂_j   (state increment)
 
-        The GP enforces the 1-Lipschitz constraint on the critic,
-        required for the Wasserstein distance estimate to be valid. 
-        Without it, the critic can grow unboundedly and training diverges.
+        Called inside torch.no_grad() for critic updates (no generator gradients
+        needed) and with the full computation graph for the generator update.
 
         Args:
-            x (torch.Tensor): State batch, shape (batch, d).
-            r_real (torch.Tensor): Real residuals from data, shape (batch, d).
-            r_fake (torch.Tensor): Fake residuals from Generator, shape (batch, d).
+            x0_batch (Tensor): (B, d) normalised initial states.
 
         Returns:
-            torch.Tensor: Scalar gradient penalty.
+            Tensor: (B, d*L) flattened fake increment sequence ŷ_{1:L}.
         """
-        batch = r_real.size(0)
+        x = x0_batch
+        increments = []
+        for _ in range(self.L):
+            z      = torch.randn(x.size(0), self.latent_dim, device=self.device, dtype=x.dtype)
+            r      = self.generator(x, z)
+            x_next = self.det_net(x) + r
+            increments.append(x_next - x)   # ŷ_{j+1} = x̂_{j+1} - x̂_j
+            x = x_next
+        y_fake = torch.stack(increments, dim=2)    # (B, d, L)
+        return y_fake.reshape(y_fake.size(0), -1)  # (B, d*L)
 
-        # One interpolation weight per sample from U(0,1)
-        # Shape (batch, 1) broadcasts against (batch, d) residuals
+    def gradient_penalty(self, x0, y_real, y_fake):
+        """
+        WGAN-GP gradient penalty in the joint (x_0, y_{1:L}) space
+        (Algorithm 4.1, lines 10-11).
 
-        alpha = torch.rand(batch, 1, device=self.device, dtype=r_real.dtype)
+        Interpolates between real and fake increment sequences, then penalises
+        any deviation of the critic's gradient norm from 1 over the full
+        (d + d*L)-dimensional critic input.
 
-        # convex combination of real and fake residuals
-        # .detach() removes r_fake from the generator's graph
-        # .requires_grad_(True) attaches fresh tracker to differentiate the critic score wrt r_hat
+        Args:
+            x0 (Tensor): (B, d) initial states (real data — not interpolated).
+            y_real (Tensor): (B, d*L) real increment sequences.
+            y_fake (Tensor): (B, d*L) fake increment sequences (detached).
 
-        r_hat = (alpha * r_real + (1 - alpha) * r_fake.detach()).requires_grad_(True)
+        Returns:
+            Tensor: Scalar gradient penalty.
+        """
+        B     = y_real.size(0)
+        alpha = torch.rand(B, 1, device=self.device, dtype=y_real.dtype)
 
-        score = self.critic(x, r_hat)
+        # Convex combination of real and fake increment sequences (line 10)
+        y_hat = alpha * y_real + (1 - alpha) * y_fake
 
-        # Compute d(score)/d(r_hat) for each sample in the batch.
-        # grad_outputs=ones_like(score): score is (batch,1), sums before differentiating, one gradient vector per sample
-        # create_graph=True: builds graph so loss_C.backward() differentiate GP term when updating critic weights
-        # retain_graph=True: keeps intermediate graph for reuse
-        # [0]: autograd.grad returns a tuple; unpack the single result
-        grad = torch.autograd.grad(
+        # Attach gradient trackers to both parts of the critic input
+        # so the penalty covers the full (x_0, ỹ_{1:L}) space (line 11)
+        x0_r    = x0.detach().requires_grad_(True)     # (B, d)
+        y_hat_r = y_hat.detach().requires_grad_(True)  # (B, d*L)
+
+        seq_input = torch.cat([x0_r, y_hat_r], dim=1)  # (B, d*(1+L))
+        score     = self.critic(seq_input)
+
+        grads = torch.autograd.grad(
             outputs=score,
-            inputs=r_hat,
+            inputs=[x0_r, y_hat_r],
             grad_outputs=torch.ones_like(score),
             create_graph=True,
             retain_graph=True,
-        )[0]
-
-        # GP = E[(||grad|| - 1)^2]: penalises any deviation of the gradient norm from 1.
-
-        # For OU d=1, norm is absolute value of the scalar gradient.
-        gp = ((grad.norm(2, dim=1) - 1) ** 2).mean()
+        )
+        # Concatenate gradients over the full input dimension (B, d*(1+L))
+        grad = torch.cat(grads, dim=1)
+        gp   = ((grad.norm(2, dim=1) - 1) ** 2).mean()
         return gp
 
     def train(self):
         """
-        Runs the WGAN-GP training loop.
+        WGAN-GP training loop (Algorithm 4.1).
 
-        For each epoch, iterates over batches. Each batch performs n_critic
-        critic updates (with gradient penalty) followed by 1 generator update.
-
-        Saves generator_final and critic_final after all epochs complete.
-        Use these for evaluation.
+        Per batch:
+          1. n_critic critic updates — each scores full L-step sequences.
+          2. 1 generator update — backprop through the full L-step rollout.
         """
         self.summary()
 
-        overal_start = time()
-        start = overal_start
+        overall_start = time()
+        start         = overall_start
 
         for ep in range(self.nepochs):
-            # Training mode: enables dropout/batchnorm if present 
             self.generator.train()
             self.critic.train()
 
-            # Accumulators for per-epoch average losses
             epoch_critic_loss = 0.
             epoch_gen_loss    = 0.
-            n_batches = 0
+            n_batches         = 0
 
-            for x_batch, r_batch in self.train_loader:
-                # Move batch to device 
-                x_batch = x_batch.to(self.device)
-                r_batch = r_batch.to(self.device)
+            for x0_batch, y_real_batch in self.train_loader:
+                x0_batch     = x0_batch.to(self.device)      # (B, d)
+                y_real_batch = y_real_batch.to(self.device)  # (B, d, L)
 
+                B = x0_batch.size(0)
 
-                # CRITIC UPDATE: n_critic times per batch (paper: 5)
-                # Loss = E[C(fake)] - E[C(real)] + lambda * GP
-                # Minimising loss pushes real scores up, fake scores down,
+                # Flatten real increments: (B, d, L) -> (B, d*L)
+                y_real_flat = y_real_batch.reshape(B, -1)
 
+                # ---- CRITIC UPDATE (n_critic times per batch) ----
+                # Fresh fake sequence per critic step; no generator gradients needed
                 for _ in range(self.n_critic):
-                    # Fresh z each critic step — shape (batch, latent_dim)
-                    z = torch.randn(x_batch.size(0), self.latent_dim,
-                                    device=self.device, dtype=x_batch.dtype)
+                    with torch.no_grad():
+                        y_fake_flat = self._rollout(x0_batch)
 
-                    # .detach() cuts the generator graph
-                    # gradient must not flow into generator during critic update step
+                    real_input = torch.cat([x0_batch, y_real_flat], dim=1)
+                    fake_input = torch.cat([x0_batch, y_fake_flat], dim=1)
 
-                    r_fake = self.generator(x_batch, z).detach()
+                    score_real = self.critic(real_input).mean()
+                    score_fake = self.critic(fake_input).mean()
+                    gp         = self.gradient_penalty(x0_batch, y_real_flat, y_fake_flat)
 
-                    gp = self.gradient_penalty(x_batch, r_batch, r_fake)
-                    score_real = self.critic(x_batch, r_batch).mean() 
-                    score_fake = self.critic(x_batch, r_fake).mean()
-
-                    # WGAN-GP critic loss
+                    # WGAN-GP critic loss (equation 4.19)
                     loss_C = score_fake - score_real + self.gp_lambda * gp
 
-                    self.opt_C.zero_grad() # clear stale gradients from last step
-                    loss_C.backward() # d(loss_C)/d(critic weights)
-                    self.opt_C.step() # Adam update — critic weights only
+                    self.opt_C.zero_grad()
+                    loss_C.backward()
+                    self.opt_C.step()
 
+                # ---- GENERATOR UPDATE (once per batch) ----
+                # Full rollout WITH computation graph — gradients flow through all L steps
+                y_fake_flat = self._rollout(x0_batch)
+                fake_input  = torch.cat([x0_batch.detach(), y_fake_flat], dim=1)
+                loss_G      = -self.critic(fake_input).mean()  # equation 4.20
 
-                # GENERATOR UPDATE — once per batch
-                # Loss = -E[C(fake)]  (maximise critic score on fakes)
+                self.opt_G.zero_grad()
+                loss_G.backward()
+                self.opt_G.step()
 
-                # Fresh z
-                # generator(x, z) so generator weights get updated
-                z = torch.randn(x_batch.size(0), self.latent_dim,
-                                device=self.device, dtype=x_batch.dtype)
-                r_fake  = self.generator(x_batch, z)
-                loss_G  = -self.critic(x_batch, r_fake).mean()
-
-                self.opt_G.zero_grad() # clear stale gradients
-                loss_G.backward() # d(loss_G)/d(generator weights)
-                self.opt_G.step() # Adam update — generator weights only
-
-                # .item() converts scalar tensor to Python float, detaches from graph
                 epoch_critic_loss += loss_C.item()
-                epoch_gen_loss += loss_G.item()
-                n_batches += 1
+                epoch_gen_loss    += loss_G.item()
+                n_batches         += 1
 
-            # Average over all batches (for OU: 400000/256 = 1562 batches/epoch)
-            epoch_critic_loss /= n_batches
-            epoch_gen_loss /= n_batches
+            self.hist[ep, 0] = epoch_critic_loss / n_batches
+            self.hist[ep, 1] = epoch_gen_loss    / n_batches
 
-            # Record in history tensor (col 0 = critic, col 1 = generator)
-            self.hist[ep, 0] = epoch_critic_loss
-            self.hist[ep, 1] = epoch_gen_loss
+            # Cosine LR decay (per epoch), applied to both critic and generator.
+            if self.sched_G is not None:
+                self.sched_G.step()
+                self.sched_C.step()
 
-            # Print progress; measure wall time per verbose interval
             if (ep + 1) % self.verbose == 0:
                 end = time()
-                print(f"Epoch {ep+1} --- Time: {end-start:.2f} seconds --- Critic loss: {epoch_critic_loss:.6f} --- Generator loss: {epoch_gen_loss:.6f}")
+                print(f"Epoch {ep+1} --- Time: {end-start:.2f}s --- "
+                      f"Critic: {self.hist[ep,0]:.6f} --- Gen: {self.hist[ep,1]:.6f}")
                 start = end
-
 
         torch.save(self.generator, self.save_path + "/generator_final")
         torch.save(self.critic,    self.save_path + "/critic_final")
 
     def save_hist(self, xlog=False, ylog=False):
-        """
-        Saves the training history to a CSV file and a PNG plot.
-
-        Args:
-            xlog (bool): Use log scale on x-axis.
-            ylog (bool): Use log scale on y-axis.
-        """
-        # Write raw loss values as plain-text CSV: two columns (critic, generator)
+        """Save training loss history to CSV and PNG."""
         savetxt(self.save_path + "/training_history_gan.csv", self.hist.numpy())
-
         plt.figure(figsize=(9, 9))
-        # hist[:, 0] = critic losses per epoch, hist[:, 1] = generator losses per epoch
         plt.plot(range(1, self.nepochs + 1), self.hist[:, 0].numpy(), label="Critic loss")
         plt.plot(range(1, self.nepochs + 1), self.hist[:, 1].numpy(), label="Generator loss")
         plt.legend()
-        if xlog:
-            plt.xscale("log")
-        if ylog:
-            plt.yscale("log")
+        if xlog: plt.xscale("log")
+        if ylog: plt.yscale("log")
         plt.xlabel("Epoch")
         plt.savefig(self.save_path + "/training_history_gan.png")
-        plt.close()   # release figure memory; omitting this leaks figures over long pipelines
+        plt.close()
 
     def summary(self):
-        """Prints model configuration before training begins."""
+        """Print model configuration before training begins."""
         print("Generator trainable parameters:", self.generator.count_params())
         print("Critic    trainable parameters:", self.critic.count_params())
         print()
@@ -302,16 +293,18 @@ class SDE:
         print("Batch size:      ", self.bsize)
         print("n_critic:        ", self.n_critic)
         print("GP lambda:       ", self.gp_lambda)
+        print("Sequence length: ", self.L)
+        if self.sched_G is not None:
+            print(f"LR schedule:       cosine (base->{self.lr_min:.0e})")
+        else:
+            print("LR schedule:       constant")
         print("The model is trained on", self.device)
 
     def set_seed(self, seed):
-        """
-        Sets all random seeds for full reproducibility.
-        Covers Python hashing, PyTorch CPU/GPU RNGs, and cuDNN algorithm selection.
-        """
+        """Set all random seeds for reproducibility."""
         os.environ['PYTHONHASHSEED'] = str(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed) # multi-GPU
-        torch.backends.cudnn.benchmark = False # don't auto-select fastest conv algorithm
-        torch.backends.cudnn.deterministic = True # force deterministic cuDNN ops
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark     = False
+        torch.backends.cudnn.deterministic = True

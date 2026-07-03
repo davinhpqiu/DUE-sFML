@@ -1,0 +1,44 @@
+seed: 0
+
+dtype: single
+
+# Geometric Brownian Motion (sFML paper, §5.1.2):
+#   dx = mu*x dt + sigma*x dW,   mu = 2.0, sigma = 1.0
+# Multiplicative noise -> the generator MUST use its state input (condition_on_state).
+
+data:
+    problem_dim: 1
+    memory: 0
+    seq_len: 40     # trajectory length L (same protocol as OU)
+
+network:
+    depth: 3
+    width: 20
+    activation: "gelu"
+    latent_dim: 1             # dim(z)=dim(x) (GAN paper convention); scalar problem
+    condition_on_state: true  # ESSENTIAL for GBM: noise amplitude scales with x
+
+training:   # Phase 1 — deterministic ResNet D_theta (faithful multi-step, eq 4.11)
+    device: "cpu"
+    valid: 0
+    epochs: 500
+    batch_size: 256
+    optimizer: "adam"
+    scheduler: "cosine"
+    learning_rate: 0.001
+    verbose: 50
+    loss: "mse"
+    save_path: "./det_model"
+
+gan:        # Phase 2 — WGAN-GP (start from the OU known-good budget: 256/1000 ~= 39k updates)
+    epochs: 1000
+    batch_size: 256
+    n_critic: 5
+    gp_lambda: 10
+    learning_rate: 0.00005
+    learning_rate_min: 0.00001   # cosine decay 5e-5 -> 1e-5 (GAN paper)
+    scheduler: "cosine"
+    adam_beta1: 0.5
+    adam_beta2: 0.999
+    verbose: 200
+    save_path: "./gan_model"
