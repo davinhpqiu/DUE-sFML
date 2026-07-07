@@ -20,3 +20,7 @@ examples/ViscousBurgers/
 examples/VorticityOSG/
 examples/WakeCylinder/
 tests/
+
+examples/OU/config_overnight.yaml
+examples/OU/det_model_overnight/
+examples/OU/gan_model_overnight/
