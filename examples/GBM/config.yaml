@@ -2,43 +2,55 @@ seed: 0
 
 dtype: single
 
-# Geometric Brownian Motion (sFML paper, §5.1.2):
-#   dx = mu*x dt + sigma*x dW,   mu = 2.0, sigma = 1.0
-# Multiplicative noise -> the generator MUST use its state input (condition_on_state).
+# Geometric Brownian Motion:  dx = mu x dt + sigma x dW,  mu=2, sigma=1
+# The full OU pipeline + Yeo-Johnson normalization (the ONLY change needed for GBM:
+# min-max crushes the exponential range; YJ discovers a log-like transform from data).
 
 data:
     problem_dim: 1
     memory: 0
-    seq_len: 40     # trajectory length L (same protocol as OU)
+    normalization: "yeojohnson"   # the fix: log-like transform discovered from data (lambda~-0.4)
 
 network:
     depth: 3
     width: 20
+    critic_depth: 4
+    critic_width: 128
     activation: "gelu"
-    latent_dim: 1             # dim(z)=dim(x) (GAN paper convention); scalar problem
-    condition_on_state: true  # ESSENTIAL for GBM: noise amplitude scales with x
+    latent_dim: 1
+    condition_on_state: true
 
-training:   # Phase 1 — deterministic ResNet D_theta (faithful multi-step, eq 4.11)
+training:   # Phase 1 — deterministic ResNet D_theta (learned, multi-step)
     device: "cpu"
     valid: 0
-    epochs: 500
+    epochs: 250
     batch_size: 256
     optimizer: "adam"
     scheduler: "cosine"
     learning_rate: 0.001
     verbose: 50
     loss: "mse"
+    use_oracle_det: false
+    phase1_single_step: false
     save_path: "./det_model"
 
-gan:        # Phase 2 — WGAN-GP (start from the OU known-good budget: 256/1000 ~= 39k updates)
+gan:                # Phase 2 — WGAN-GP (full working pipeline)
     epochs: 1000
-    batch_size: 256
+    batch_size: 1000
     n_critic: 5
     gp_lambda: 10
     learning_rate: 0.00005
-    learning_rate_min: 0.00001   # cosine decay 5e-5 -> 1e-5 (GAN paper)
-    scheduler: "cosine"
+    lr_decay: true
+    lr_min: 0.00001
     adam_beta1: 0.5
     adam_beta2: 0.999
-    verbose: 200
+    verbose: 10
+    checkpoint_interval: 100
+    selection_std_weight: 1.0
+    selection_wgap_weight: 1.0
+    selection_gp_weight: 1.0
+    selection_mean_weight: 0.0
+    mmd_lambda: 1.0
+    center_generator: true
+    center_K: 16
     save_path: "./gan_model"
