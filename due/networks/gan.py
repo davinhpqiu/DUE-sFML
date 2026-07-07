@@ -155,32 +155,40 @@ class Generator(nn):
 
 class Critic(nn):
     """
-    Critic network C_psi for sequence-level WGAN-GP (Algorithm 4.1, Chen & Xiu 2024).
+    Critic network C_psi for Wasserstein GAN training.
 
-    Scores a full trajectory sequence rather than a single (state, residual) pair,
-    matching the paper exactly:
+    Maps a state and either a one-step residual or a residual sequence to a raw
+    scalar score:
 
         score = C_psi(x_0, y_{1:L})
 
-    where x_0 is the initial state and y_{1:L} = [y_1, ..., y_L] is the sequence
-    of L state increments (y_j = x_j - x_{j-1}).
-
-    Input is the concatenation [x_0, y_1, ..., y_L], dimension d*(1+L).
-    For OU: d=1, L=40  →  input dim = 41.
+    The critic is trained to maximise the gap between scores for real and fake residuals. 
+    The generator is trained to make fake residuals indistinguishable from real ones.
 
     Args:
-        config (dict): Configuration parameters.
-            - problem_dim (int): State dimension d.
-            - seq_len (int): Sequence length L (number of increments).
-            - depth (int): Number of hidden layers.
-            - width (int): Neurons per hidden layer.
-            - activation (str): Activation function name.
-            - dtype (str): 'single' or 'double'.
-            - seed (int): Random seed.
+        config (dict): A dictionary containing configuration parameters.
+            - problem_dim (int): The number of state variables d.
+            - memory (int): Number of past states in the state input (default 0).
+            - sequence_length (int): Number of increments scored by the critic.
+            - condition_on_state (bool): If True, Critic receives (x, y); if False, only y.
+            - depth (int): The number of hidden layers.
+            - width (int): The number of neurons in each hidden layer.
+            - activation (str): The activation function name.
+            - dtype (str): The data type ('single' or 'double').
+            - seed (int): The random seed.
 
     Attributes:
-        input_dim (int): d*(1+L) — dimension of the flattened sequence input.
-        output_dim (int): 1 — raw Wasserstein score (no sigmoid).
+        output_dim (int): Always 1 — a scalar Wasserstein score.
+        input_dim (int): Dimension of the network input.
+        memory_steps (int): Number of past states in the input window.
+        condition_on_state (bool): Whether x is included in the input.
+        depth (int): Number of hidden layers.
+        width (int): Number of neurons per hidden layer.
+        activation (function): Activation function.
+        layers (torch.nn.ModuleList): List of linear layers.
+
+    Methods:
+        forward(x, r): Computes the scalar score C_psi(concat(x, r)) or C_psi(r).
     """
 
     def __init__(self, config):
@@ -188,49 +196,79 @@ class Critic(nn):
 
         self.output_dim = 1
 
-        d = config["problem_dim"]
-        L = config["seq_len"]            # trajectory length from data config
+        # Same memory convention as the Generator
+        self.memory_steps = config.get("memory", 0)
 
-        # Critic input: (x_0, y_{1:L}) concatenated — d + d*L = d*(1+L) dimensions
-        self.input_dim = d * (1 + L)
+        # condition_on_state = True (paper): input is concat(x_window, r)
+        # condition_on_state = False (unconditional):  input is r only
+        self.condition_on_state = config.get("condition_on_state", True)
 
-        self.depth      = config["depth"]
-        self.width      = config["width"]
+        self.problem_dim = config["problem_dim"]
+        self.sequence_length = config.get("sequence_length", 1)
+
+        # State input d*(memory+1). Increment sequence y_{1:L} has d*L entries.
+        state_input_dim = config["problem_dim"] * (self.memory_steps + 1)
+        sequence_input_dim = config["problem_dim"] * self.sequence_length
+        self.input_dim  = (state_input_dim + sequence_input_dim
+                           if self.condition_on_state else sequence_input_dim)
+
+        # Critic may use its OWN (larger) capacity, independent of the generator, via
+        # critic_depth / critic_width. Falls back to the shared depth/width if unset.
+        # Rationale: the critic must be a strong enough Wasserstein witness to police
+        # the increment VARIANCE (weak 3x20 critic gives W-gap~0 while std differs 5x).
+        self.depth = config.get("critic_depth", config["depth"])
+        self.width = config.get("critic_width", config["width"])
         self.activation = get_activation(config["activation"])
-        self.dtype      = config["dtype"]
+        self.dtype = config["dtype"]
 
         self.set_seed(config["seed"])
         self.layers = torch.nn.ModuleList()
 
         if self.dtype == "double":
             for i in range(self.depth):
-                in_f = self.input_dim if i == 0 else self.width
-                self.layers.append(torch.nn.Linear(in_f, self.width).double())
+                if i == 0:
+                    self.layers.append(torch.nn.Linear(self.input_dim, self.width).double())
+                else:
+                    self.layers.append(torch.nn.Linear(self.width, self.width).double())
+            # Output layer maps to a single scalar — the Wasserstein score
             self.layers.append(torch.nn.Linear(self.width, self.output_dim).double())
 
         elif self.dtype == "single":
             for i in range(self.depth):
-                in_f = self.input_dim if i == 0 else self.width
-                self.layers.append(torch.nn.Linear(in_f, self.width).float())
+                if i == 0:
+                    self.layers.append(torch.nn.Linear(self.input_dim, self.width).float())
+                else:
+                    self.layers.append(torch.nn.Linear(self.width, self.width).float())
             self.layers.append(torch.nn.Linear(self.width, self.output_dim).float())
         else:
             print("self.dtype error. The self.dtype must be either single or double.")
             exit()
 
-    def forward(self, seq):
+    def forward(self, x, y):
         """
-        Forward pass.
+        Forward pass through the Critic.
+
+        Called during the critic update with real and generated increment
+        sequences. Called during the generator update with generated increments
+        only, where the generator tries to increase the critic score.
 
         Args:
-            seq (Tensor): (batch, d*(1+L)) — concatenated (x_0, y_{1:L}).
-                          Build this with: torch.cat([x0, y_flat], dim=1)
+            x (torch.Tensor): Normalised initial state/window, shape (batch, d*(memory+1)).
+                              Ignored when condition_on_state is False.
+            y (torch.Tensor): Increment sequence to score. Shape can be
+                              (batch, d) for one-step training or (batch, d, L)
+                              for Algorithm 4.1 sequence training.
 
         Returns:
-            Tensor: (batch, 1) raw Wasserstein score.
-                    Higher = critic judges the sequence as more likely real.
-                    No sigmoid — unbounded real number.
+            torch.Tensor: Raw Wasserstein score, shape (batch, 1).
+                          Higher = critic judges y as more likely real.
+                          No sigmoid — this is an unbounded real number.
         """
-        inp = seq
+        y_flat = y.reshape(y.shape[0], -1)
+        inp = torch.cat([x, y_flat], dim=-1) if self.condition_on_state else y_flat
+
+        # Hidden layers with activation
         for l in self.layers[:-1]:
             inp = self.activation(l(inp))
+
         return self.layers[-1](inp)

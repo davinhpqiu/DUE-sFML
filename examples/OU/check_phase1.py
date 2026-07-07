@@ -41,7 +41,7 @@ trainX_p1 = train_seqs[:, :, 0]   # (N, d)
 trainY_p1  = train_seqs[:, :, 1:] # (N, d, L)
 
 # Train Phase 1
-det_net = due.networks.fcn.resnet(vmin, vmax, conf_net)
+det_net = due.networks.fcn.gated_resnet(vmin, vmax, conf_net)
 phase1_model = due.models.ODE(trainX_p1, trainY_p1, det_net, conf_train)
 phase1_model.train()
 phase1_model.save_hist()

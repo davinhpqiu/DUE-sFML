@@ -1,0 +1,59 @@
+seed: 0
+
+dtype: single
+
+# SDE with nonlinear diffusion (Chen & Xiu 2024, sec. 5.2.1):
+#   dx = -mu x dt + sigma e^{-x^2} dW,   mu=5, sigma=0.5
+# Linear mean-reverting drift (a(x) = -mu x, reverts to 0) but a NON-monotonic,
+# bell-shaped diffusion (b(x) = sigma e^{-x^2}, peaks at x=0). Tests whether the
+# generator can learn an arbitrary state-dependent diffusion shape.
+# States are bounded ~[-1,1] and well-behaved, so min-max normalization is fine.
+
+data:
+    problem_dim: 1
+    memory: 0
+    normalization: "minmax"
+
+network:
+    depth: 3
+    width: 20
+    critic_depth: 4
+    critic_width: 128
+    activation: "gelu"
+    latent_dim: 1
+    condition_on_state: true
+
+training:   # Phase 1 — deterministic ResNet D_theta (learned, multi-step)
+    device: "cpu"
+    valid: 0
+    epochs: 250
+    batch_size: 256
+    optimizer: "adam"
+    scheduler: "cosine"
+    learning_rate: 0.001
+    verbose: 50
+    loss: "mse"
+    use_oracle_det: false
+    phase1_single_step: false
+    save_path: "./det_model"
+
+gan:                # Phase 2 — WGAN-GP (full working pipeline)
+    epochs: 5000            # longer run: test whether the bell diffusion sharpens (variance channel is well-conditioned)
+    batch_size: 1000
+    n_critic: 5
+    gp_lambda: 10
+    learning_rate: 0.00005
+    lr_decay: true
+    lr_min: 0.00001
+    adam_beta1: 0.5
+    adam_beta2: 0.999
+    verbose: 100
+    checkpoint_interval: 500
+    selection_std_weight: 1.0
+    selection_wgap_weight: 1.0
+    selection_gp_weight: 1.0
+    selection_mean_weight: 0.0
+    mmd_lambda: 1.0
+    center_generator: true
+    center_K: 16
+    save_path: "./gan_model"

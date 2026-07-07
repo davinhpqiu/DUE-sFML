@@ -7,83 +7,112 @@ Follows Section 5.1.1 of:
 
 Two-phase training:
   Phase 1: Train deterministic sub-map D_theta (ResNet) via MSE.
-  Phase 2: Train Generator G_phi and Critic C_psi (WGAN-GP) on residuals.
+  Phase 2: Train S_delta and Critic C_psi (WGAN-GP) on full increment
+           sequences (x0, y1:L), following Algorithm 4.1.
 
 Run from examples/OU/ directory:
   python OU.py
 """
 
 import numpy as np
-import scipy.io as sio
 import torch
 import matplotlib.pyplot as plt
 from yaml import safe_load
 from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import due
 
-# Config
+# Config  (optional path arg:  python OU.py [config.yaml])
 
-conf_data, conf_net, conf_train = due.utils.read_config("config.yaml")
+CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+print(f">>> Using config: {CONFIG_PATH}")
+conf_data, conf_net, conf_train = due.utils.read_config(CONFIG_PATH)
 
 # Build Phase 2 config by extending 'gan' section global fields
 
-config_raw = safe_load(Path("config.yaml").read_text())
+config_raw = safe_load(Path(CONFIG_PATH).read_text())
 conf_gan = config_raw["gan"]
-conf_gan["seed"]       = config_raw["seed"]
-conf_gan["dtype"]      = config_raw["dtype"]
-conf_gan["device"]     = conf_train["device"]
+conf_gan["seed"] = config_raw["seed"]
+conf_gan["dtype"] = config_raw["dtype"]
+conf_gan["device"] = conf_train["device"]
 conf_gan["latent_dim"] = conf_net["latent_dim"]
 
-# Propagate seq_len into conf_net so the Critic knows its input dimension
-conf_net["seq_len"] = conf_data["seq_len"]
-
 # Data
-# Call sde_dataset only to obtain vmin/vmax (joint min-max over all states)
-# and the raw test trajectories. We do NOT use the pair-extracted trainX/trainY.
+
 data_loader = due.datasets.sde.sde_dataset(conf_data)
-_, _, test_data, vmin, vmax = data_loader.load(
+trainX, trainY, test_data, vmin, vmax = data_loader.load_sequence(
     "OU_train.mat", "OU_test.mat"
 )
+# trainX: shape (N, d), normalized x0
+# trainY: shape (N, d, L), normalized x1,...,xL
 # test_data: shape (N_test, d, T_test+1), raw (unnormalized)
 
-# Load raw training trajectories and normalise to [-1, 1] using the same
-# vmin/vmax computed above. Shape: (N, d, L+1).
-raw_seqs   = sio.loadmat("OU_train.mat")["trajectories"]          # (N, d, L+1), raw
-# vmin/vmax are (1, d); broadcast over the time axis with [:, :, None]
-train_seqs = (2 * (raw_seqs - 0.5 * (vmax[:, :, None] + vmin[:, :, None]))
-              / (vmax[:, :, None] - vmin[:, :, None])).astype(np.float32)
-# train_seqs: (N, d, L+1) normalised — used for both Phase 1 and Phase 2
+conf_net["sequence_length"] = trainY.shape[-1]
 
-# Phase 1 — Deterministic Sub-map D_theta (ResNet), multi-step rollout loss
-#
-# The paper's loss (eq. 4.11) rolls D_theta from x_0^(i) for L steps and
-# minimises sum_{n=1}^{L} ||x_n^(i) - D_theta^[n](x_0^(i))||^2.
-# This trains the network to stay accurate over multi-step predictions
-# (the "recurrent structure" shown in Figure 2 of the paper).
-#
-# trainX_p1: initial conditions x_0, shape (N, d)
-# trainY_p1: full trajectory targets (x_1,...,x_L), shape (N, d, L)
-trainX_p1 = train_seqs[:, :, 0]    # (N, d)
-trainY_p1  = train_seqs[:, :, 1:]  # (N, d, L) — ODE model sees multi_steps = L = 40
+# Phase 1 — Deterministic Sub-map D_theta (ResNet)
 
-det_net = due.networks.fcn.resnet(vmin, vmax, conf_net)
-phase1_model = due.models.ODE(trainX_p1, trainY_p1, det_net, conf_train)
-phase1_model.train()
-phase1_model.save_hist()
-# det_net is frozen inside SDE.__init__
+import os as _os
+
+class OracleDet(torch.nn.Module):
+    """Phase-1 ABLATION: exact OU Euler conditional-mean map
+    D(x) = x + theta*(mu - x)*dt  (fixed point = mu, linear -> extrapolates exactly).
+    Operates in NORMALISED space: forward(u) = normalize(D(denormalize(u)))."""
+    def __init__(self, vmin, vmax, theta=1.0, mu=1.2, dt=0.01):
+        super().__init__()
+        c = 0.5 * (float(vmax) + float(vmin))
+        h = 0.5 * (float(vmax) - float(vmin))
+        self.register_buffer("c", torch.tensor(c))
+        self.register_buffer("h", torch.tensor(h))
+        self.theta, self.mu, self.dt = theta, mu, dt
+    def forward(self, u):
+        x = u * self.h + self.c
+        y = x + self.theta * (self.mu - x) * self.dt
+        return (y - self.c) / self.h
+    def count_params(self):
+        return 0
+
+if conf_train.get("use_oracle_det", False):
+    print(">>> Phase-1 ABLATION: D_theta replaced by the EXACT OU oracle (no Phase-1 training)")
+    det_net = OracleDet(float(vmin.flatten()[0]), float(vmax.flatten()[0]))
+    _os.makedirs(conf_train["save_path"], exist_ok=True)
+    torch.save(det_net, conf_train["save_path"] + "/model")
+else:
+    det_net = due.networks.fcn.resnet(vmin, vmax, conf_net)
+    phase1_model = due.models.ODE(trainX, trainY, det_net, conf_train)
+    phase1_model.train()
+    phase1_model.save_hist()
+
+# Use the best deterministic map saved during Phase 1, then freeze it in SDE.__init__.
+det_net = torch.load(
+    conf_train["save_path"] + "/model",
+    map_location=conf_train["device"],
+    weights_only=False,
+)
+
+# Phase 2 — WGAN-GP (Generator + Critic)
 
 generator = due.networks.gan.Generator(conf_net)
-critic    = due.networks.gan.Critic(conf_net)   # input_dim = d*(1+L) = 41 for OU
+critic    = due.networks.gan.Critic(conf_net)
 
-sde_model = due.models.SDE(train_seqs, det_net, generator, critic, conf_gan)
+sde_model = due.models.SDE(trainX, trainY, det_net, generator, critic, conf_gan)
 sde_model.train()
 sde_model.save_hist()
 
 # Evaluation
 
 device = conf_train["device"]
-generator = torch.load(conf_gan["save_path"] + "/generator_final", map_location=device, weights_only=False)
-det_net   = torch.load(conf_train["save_path"] + "/model",         map_location=device, weights_only=False)
+generator_path = Path(conf_gan["save_path"]) / "generator_best"
+if not generator_path.exists():
+    generator_path = Path(conf_gan["save_path"]) / "generator_final"
+print("Loading generator from", generator_path)
+
+generator = torch.load(str(generator_path), map_location=device, weights_only=False)
+det_net   = torch.load(conf_train["save_path"] + "/model", map_location=device, weights_only=False)
 generator.eval()
 det_net.eval()
 
@@ -93,7 +122,7 @@ MU    = 1.2
 SIGMA = 0.3
 DT    = 0.01
 X0_TEST   = 1.5
-N_SAMPLES = 100_000 # ensemble size (paper value; 10,000 for fast check)
+N_SAMPLES = 10_000 # ensemble size (use 100,000 for paper; 10,000 for fast check)
 N_STEPS   = 400 # T=4.0 / DT=0.01
 LATENT_DIM = conf_net["latent_dim"]
 
@@ -101,12 +130,36 @@ vmin_val = float(vmin.flatten()[0])
 vmax_val = float(vmax.flatten()[0])
 torch_dtype = torch.float64 if conf_data["dtype"] == "double" else torch.float32
 
+# Hard-centering toggle (must MIRROR the training setting in config.yaml so the
+# model is evaluated the same way it was trained).
+CENTER_GEN = bool(conf_gan.get("center_generator", False))
+CENTER_K   = int(conf_gan.get("center_K", 16))
+print(f"Evaluation hard-centering: {'ON (K=%d)' % CENTER_K if CENTER_GEN else 'OFF'}")
+
+
+# Route through the fitted normaliser (identical to the old min-max formula for
+# normalization="minmax"; enables "none"/raw and "yeojohnson" via config).
+NZ = data_loader.normalizer
 
 def normalize(x):
-    return 2 * (x - 0.5 * (vmax_val + vmin_val)) / (vmax_val - vmin_val)
+    a = np.asarray(x, dtype=np.float64)
+    return NZ.transform(a.reshape(-1, 1)).reshape(a.shape)
 
 def denormalize(x):
-    return x * 0.5 * (vmax_val - vmin_val) + 0.5 * (vmax_val + vmin_val)
+    a = np.asarray(x, dtype=np.float64)
+    return NZ.inverse(a.reshape(-1, 1)).reshape(a.shape)
+
+
+def gen_increment(x, n_samples):
+    """Stochastic sub-map draw S_delta(x, z), hard-centered per state when CENTER_GEN."""
+    if not CENTER_GEN:
+        z = torch.randn(n_samples, LATENT_DIM, device=device, dtype=torch_dtype)
+        return generator(x, z)
+    z = torch.randn(n_samples, CENTER_K, LATENT_DIM, device=device, dtype=torch_dtype)
+    x_rep = x.unsqueeze(1).expand(-1, CENTER_K, -1).reshape(n_samples * CENTER_K, x.size(-1))
+    out = generator(x_rep, z.reshape(n_samples * CENTER_K, LATENT_DIM))
+    out = out.reshape(n_samples, CENTER_K, -1)
+    return out[:, 0, :] - out.mean(dim=1)
 
 
 def stochastic_predict(x0_raw, n_samples, n_steps):
@@ -123,8 +176,7 @@ def stochastic_predict(x0_raw, n_samples, n_steps):
 
     with torch.no_grad():
         for _ in range(n_steps):
-            z      = torch.randn(n_samples, LATENT_DIM, device=device, dtype=torch_dtype)
-            r_fake = generator(x, z)
+            r_fake = gen_increment(x, n_samples)
             x      = det_net(x) + r_fake
             traj.append(denormalize(x.cpu().numpy()[:, 0]))
 
@@ -135,9 +187,8 @@ def stochastic_predict(x0_raw, n_samples, n_steps):
 # check generator output has mean ~0 and std ~ SIGMA * sqrt(DT) / (0.5*(vmax-vmin)) in normalized space
 with torch.no_grad():
     x_test = torch.zeros(10000, 1, dtype=torch_dtype, device=device)
-    z_test = torch.randn(10000, LATENT_DIM, dtype=torch_dtype, device=device)
-    r_test = generator(x_test, z_test).cpu().numpy()
-print(f"\nGenerator residual check (normalized space, x=0):")
+    r_test = gen_increment(x_test, 10000).cpu().numpy()
+print(f"\nGenerator residual check (normalized space, x=0, centering={'ON' if CENTER_GEN else 'OFF'}):")
 print(f"  mean = {r_test.mean():.6f}  (expected ~0)")
 print(f"  std  = {r_test.std():.6f}   (expected ~{0.3 * (0.01**0.5) / (0.5*(vmax_val-vmin_val)):.4f})")
 
@@ -199,23 +250,6 @@ plt.savefig(save_path + "/mean_std.png", dpi=150)
 plt.close()
 print("Saved mean_std.png")
 
-# Fig 4: Sample trajectories — training data (left) vs sFML model (right)
-t_train = np.arange(raw_seqs.shape[2]) * DT
-n_show  = 50
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-for i in range(min(n_show, raw_seqs.shape[0])):
-    axes[0].plot(t_train, raw_seqs[i, 0, :], lw=0.7, alpha=0.6)
-axes[0].set_xlabel('t'); axes[0].set_ylabel('x')
-axes[0].set_title('Training data samples')
-for i in range(min(n_show, ensemble.shape[0])):
-    axes[1].plot(t_arr, ensemble[i, :], lw=0.7, alpha=0.6)
-axes[1].set_xlabel('t'); axes[1].set_ylabel('x')
-axes[1].set_title(f'sFML model samples ($x_0={X0_TEST}$, T={N_STEPS * DT:.0f})')
-plt.tight_layout()
-plt.savefig(save_path + "/trajectories.png", dpi=150)
-plt.close()
-print("Saved trajectories.png")
-
 # Fig 6: Effective Drift and Diffusion Recovery
 # Estimate from the ensemble at each state value using binning
 x_vals  = ensemble[:, :-1].flatten()
@@ -276,50 +310,34 @@ plt.savefig(save_path + "/conditional_dist.png", dpi=150)
 plt.close()
 print("Saved conditional_dist.png")
 
-# Fig 8: Covariance-matrix spectra (paper's Fig 8)
-# Eigenvalue spectrum of the covariance matrix of the length-(N_STEPS+1) solution
-# sequence: Prediction (sFML from x0=1.5) vs Ground Truth (test data from x0=1.5).
-pred_seq  = ensemble                        # (M, N_STEPS+1)
-truth_seq = test_data[:, 0, :]              # (N_test, N_STEPS+1) ground-truth OU paths
-cov_pred  = np.cov(pred_seq,  rowvar=False)
-cov_truth = np.cov(truth_seq, rowvar=False)
-eig_pred  = np.clip(np.sort(np.linalg.eigvalsh(cov_pred))[::-1],  1e-16, None)
-eig_truth = np.clip(np.sort(np.linalg.eigvalsh(cov_truth))[::-1], 1e-16, None)
-k = np.arange(1, len(eig_pred) + 1)
+# Fig 8: Covariance Spectra
+# Use test ensemble started from the stationary distribution (many trajectories, long time)
+# Approximate: use a long stationary run starting from X0_TEST after a burn-in
+ensemble_cov = stochastic_predict(X0_TEST, N_SAMPLES, N_STEPS)  # reuse
+# After t > 2 the process is approximately stationary; use second half
+burnin = N_STEPS // 2
+X_stat = ensemble_cov[:, burnin:]          # (N_SAMPLES, N_STEPS//2 + 1)
+T_cov  = X_stat.shape[1]
 
-fig, ax = plt.subplots(figsize=(7, 5))
-ax.semilogy(k, eig_truth, 'k-',  label='Ground Truth')
-ax.semilogy(k, eig_pred,  'r--', label='Prediction')
-ax.set_xlabel('Index')
-ax.set_ylabel('Eigenvalue')
-ax.set_title('Covariance matrix spectra')
-ax.legend()
-plt.tight_layout()
-plt.savefig(save_path + "/covariance_spectra.png", dpi=150)
-plt.close()
-print("Saved covariance_spectra.png (eigenvalue spectrum)")
-
-# Bonus (not a paper figure): covariance function C(tau) vs analytical, from x0=1.5
+# Empirical covariance C(lag) = E[(x(t) - mu)(x(t+lag) - mu)]
 mu_stat = MU
-burnin  = N_STEPS // 2
-X_stat  = ensemble[:, burnin:]              # near-stationary tail
-T_cov   = X_stat.shape[1]
-C_pred  = np.array([
+C_pred = np.array([
     np.mean((X_stat[:, :T_cov - lag] - mu_stat) * (X_stat[:, lag:] - mu_stat))
     for lag in range(min(T_cov, 100))
 ])
 tau    = np.arange(len(C_pred)) * DT
 C_true = (SIGMA ** 2 / (2 * THETA)) * np.exp(-THETA * tau)
+
 fig, ax = plt.subplots(figsize=(7, 5))
 ax.plot(tau, C_true, 'k-',  label='Analytical')
 ax.plot(tau, C_pred, 'r--', label='sFML')
 ax.set_xlabel('Lag $\\tau$')
 ax.set_ylabel('Covariance $C(\\tau)$')
-ax.set_title('Covariance function')
+ax.set_title('Covariance Spectra')
 ax.legend()
 plt.tight_layout()
-plt.savefig(save_path + "/covariance_function.png", dpi=150)
+plt.savefig(save_path + "/covariance_spectra.png", dpi=150)
 plt.close()
-print("Saved covariance_function.png")
+print("Saved covariance_spectra.png")
 
 print("\nAll evaluation figures saved to", save_path)

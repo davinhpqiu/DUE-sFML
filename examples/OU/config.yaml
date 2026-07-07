@@ -7,36 +7,50 @@ dtype: single
 data:
     problem_dim: 1
     memory: 0       # required by resnet; no memory window for SDE
-    seq_len: 40     # trajectory length L used in Phase 2 (Algorithm 4.1)
+    normalization: "none"   # RAW test (paper does not normalize). "minmax" = baseline, "yeojohnson" = GBM fix
 
 network:
-    depth: 3        # hidden layers
-    width: 20       # neurons per layer
+    depth: 3        # hidden layers (generator)
+    width: 20       # neurons per layer (generator)
+    critic_depth: 4         # STEP 2: stronger critic (independent of generator). Comment out -> falls back to depth/width
+    critic_width: 128       # ~4x critic input dim (41) -> capacity to witness the increment variance
     activation: "gelu"
-    latent_dim: 1           # dim(z)=dim(x) per GAN paper convention (was 8); OU noise is 1-D
-    condition_on_state: true  #Generator takes (x,z), Critic takes (x,r)
+    latent_dim: 1           # dim(z)=dim(x) (GAN-paper convention); leaner input -> less spurious x-tilt in the drift
+    condition_on_state: true  # Generator takes (x,z), Critic takes (x0,y1:L)
 
 training:   # Phase 1 — deterministic ResNet D_theta
     device: "cpu"
     valid: 0
-    epochs: 500     # faithful multi-step (eq 4.11); D_theta needn't be accurate (Remark 4.1). More epochs made the fixed point WORSE (under-constrained), so keep it modest.
-    batch_size: 256
+    epochs: 250
+    batch_size: 256   # multi-step: 10k trajectories -> ~39 batches/epoch
     optimizer: "adam"
     scheduler: "cosine"
     learning_rate: 0.001
     verbose: 50
     loss: "mse"
+    use_oracle_det: false  # PHASE 1: learned ResNet D_theta (was true for the oracle ablation)
+    phase1_single_step: false  # multi-step rollout loss (eq 4.11, the paper's Phase 1)
     save_path: "./det_model"
 
 gan:                # Phase 2 — WGAN-GP Generator + Critic
-    epochs: 1000    # best baseline (~39k updates); batch-1024 test made over-dispersion worse, so reverted
-    batch_size: 256 # reverted to baseline (paper §5.1.1)
-    n_critic: 5     # critic steps per generator step (paper §5.1.1)
+    epochs: 1000   # use 100000 for the full paper-scale run
+    batch_size: 1000 # batches are trajectory sequences, not one-step pairs
+    n_critic: 5     # update generator once every 5 critic updates
     gp_lambda: 10   # gradient penalty weight (paper §5.1.1)
     learning_rate: 0.00005  # paper §5.1.1: 5e-5
-    learning_rate_min: 0.00001  # GAN paper: cosine-decay 5e-5 -> 1e-5
-    scheduler: "cosine"         # GAN paper: cosine LR decay (was constant)
+    lr_decay: true          # cosine LR decay (2022 GAN paper) to damp the minimax oscillation
+    lr_min: 0.00001         # decay 5e-5 -> 1e-5 over training
     adam_beta1: 0.5          # paper §5.1.1
     adam_beta2: 0.999        # paper §5.1.1
-    verbose: 200    # ~5 prints over the 1000-epoch run
+    verbose: 10
+    checkpoint_interval: 100
+    selection_std_weight: 1.0
+    selection_wgap_weight: 1.0
+    selection_gp_weight: 1.0
+    selection_mean_weight: 0.0   # CONTROL: mean ignored in selection (professor's original behaviour)
+    mmd_lambda: 1.0              # FULL PIPELINE: CR-GAN consistency stabiliser ON
+    center_generator: true       # FULL PIPELINE: hard-center S_delta (D_theta owns the mean)
+    center_K: 16                 # Monte-Carlo draws for the per-state mean estimate (not a tuned knob)
+    # mmd_lambda set to 1.0 above (STEP 3 run): CR-GAN consistency term to damp the
+    # std oscillation + pull in the mild tail over-dispersion. Strong critic already on.
     save_path: "./gan_model"

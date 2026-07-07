@@ -51,7 +51,7 @@ N_TEST        = 10_000   # number of test trajectories from x0=1.5
 X0_TEST       = 1.5      # test initial condition (paper §5.1.1)
 STEPS_TEST    = 400      # E-M steps  (T=4.0 / dt=0.01)
 
-SEED = 0
+SEED = 1
 
 
 # Euler-Maruyama integrator

@@ -1,0 +1,60 @@
+seed: 0
+
+dtype: single
+
+# OVERNIGHT SCALE TEST: paper's UN-CENTERED design at scale.
+# Question: does more training + cosine LR decay let the un-centered GAN converge
+# to mean=1.2 on its own? (centered baseline lives in config.yaml)
+#   - centering OFF, MMD OFF  (plain sFML design)
+#   - lr_decay ON             (damps the minimax oscillation over the long schedule)
+#   - 4x128 critic            (our one kept improvement -> fairest shot for un-centered)
+#   - 70,000 epochs           (~12-14 h on CPU at ~0.65 s/epoch un-centered)
+# Run:  python OU.py config_overnight.yaml
+
+data:
+    problem_dim: 1
+    memory: 0
+
+network:
+    depth: 3
+    width: 20
+    critic_depth: 4
+    critic_width: 128
+    activation: "gelu"
+    latent_dim: 1
+    condition_on_state: true
+
+training:   # Phase 1 — deterministic ResNet D_theta (learned, multi-step)
+    device: "cpu"
+    valid: 0
+    epochs: 250
+    batch_size: 256
+    optimizer: "adam"
+    scheduler: "cosine"
+    learning_rate: 0.001
+    verbose: 50
+    loss: "mse"
+    use_oracle_det: false
+    phase1_single_step: false
+    save_path: "./det_model_overnight"
+
+gan:                # Phase 2 — WGAN-GP (un-centered, decayed, long)
+    epochs: 70000            # OVERNIGHT scale test
+    batch_size: 1000
+    n_critic: 5
+    gp_lambda: 10
+    learning_rate: 0.00005
+    lr_decay: true          # cosine 5e-5 -> 1e-5 over the FULL 70k schedule (Robbins-Monro damping)
+    lr_min: 0.00001
+    adam_beta1: 0.5
+    adam_beta2: 0.999
+    verbose: 100            # print every 100 epochs (keeps the log ~700 lines)
+    checkpoint_interval: 1000  # 70 checkpoints over the run
+    selection_std_weight: 1.0
+    selection_wgap_weight: 1.0
+    selection_gp_weight: 1.0
+    selection_mean_weight: 0.0
+    mmd_lambda: 0.0         # OFF — plain paper design
+    center_generator: false # OFF — the whole point of this test
+    center_K: 16
+    save_path: "./gan_model_overnight"
