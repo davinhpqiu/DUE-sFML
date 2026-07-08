@@ -45,13 +45,16 @@ difference is the data-derived normalization; nothing assumes the governing equa
 
 ### Toggles (all in config; defaults = original behaviour)
 `center_generator`, `center_K`, `mmd_lambda`, `lr_decay`/`lr_min`, `critic_depth`/
-`critic_width`, `use_oracle_det`, `phase1_single_step`, `data.normalization`
-(minmax | none | yeojohnson). `OU.py`/`GBM.py` take an optional config path arg.
+`critic_width`, `use_oracle_det`, `phase1_single_step`, `network.det_arch`
+(resnet | gated_resnet), `data.normalization` (minmax | none | yeojohnson).
+`OU.py`/`GBM.py`/`check_phase1.py` take an optional config path arg.
+(Removed: the `phase1_loss_space` J-reweighting experiment — dead end, see Part 15.)
 
 ### Next
-Optional D̃ complexity-control (tighten OU 1.157→~1.18). Then the nonlinear /
-double-well / non-Gaussian / 2D examples (each stresses a different component:
-D̃ curvature, generator multimodality/skew, dimension — pipeline structure should carry).
+**GBM Phase-1 mean solved by raw units + gated_resnet (Part 15).** Decisive open test: run the
+full `GBM.py` in raw and check whether Phase-2 diffusion survives without YJ — if not, decouple
+coordinates (D̃ raw / S̃ YJ). Then the nonlinear / double-well / non-Gaussian / 2D examples
+(each stresses a different component: D̃ curvature, generator multimodality/skew, dimension).
 
 ---
 
@@ -751,3 +754,61 @@ in the dense / large-variance region**:
 
 **Status: still a success overall** — mean, std, drift all excellent and stable; only the
 effective-diffusion *figure* at the sparse edges is partial. Headline reproduction holds.
+
+---
+
+## Part 15 — GBM Phase-1 undershoot SOLVED: raw units + gated_resnet (normalization destroys linearity)
+
+**Problem.** GBM Phase-1 rollout undershot badly: D̃ from x₀=0.5 reached only ~2.54 at
+T=1.0 vs analytical 3.6945 (**−31%**), despite near-perfect single-step accuracy. A ~0.38%
+per-step multiplicative shortfall compounded over 100 steps. (`check_phase1.py`.)
+
+**Root cause (general, not GBM-specific).** GBM's conditional mean E[x₁|x₀]=x₀·e^{μΔ} is
+**linear** in x₀. But Yeo-Johnson is nonlinear, so *in YJ coordinates the linear map becomes a
+curve*. The network must approximate that curve with its MLP, leaving sub-percent ripples in
+the per-step growth that compound. **The normalization that Phase 2 needs (variance
+stabilisation for the multiplicative diffusion) destroys the linearity Phase 1 depends on.**
+Same lesson applies to any linear-/affine-mean SDE (OU included).
+
+**Dead end — loss-coordinate reweighting (removed).** Hypothesis: YJ compresses the high-x
+tail, so the normalized MSE down-weights it. Tried a `phase1_loss_space` toggle
+(normalized|physical|relative) that reweights the Phase-1 error by the transform's local
+stretch J = d(physical)/d(normalized) (delta-method, evaluated at the in-range target so it
+can't explode; an earlier version that denormalised the *prediction* blew up to 1e22 and
+collapsed to a contracting map). Result: **`relative` made it WORSE** (−60%, 1.49). It treats
+a symptom; the real cause is the coordinate, not the loss weighting. **All of it reverted/
+removed** — `ode.py` back to plain MSE, no `normalizer` arg, no `phase1_loss_space` key.
+
+**The fix — raw units.** Set `data.normalization: "none"` (raw). The mean is linear again,
+the net fits and extrapolates it cleanly. Ladder (T=1.0 endpoint, x₀=0.5, analytical 3.6945):
+
+| Phase-1 setup | endpoint | error | per-step bias |
+|---|---|---|---|
+| YJ, resnet, plain MSE (baseline) | 2.54 | −31% | −0.38% |
+| YJ, resnet, `relative` (J-reweight) | 1.49 | −60% | −0.90% |
+| raw, resnet | 3.98 | +8% | +0.07% |
+| **raw, gated_resnet** | **3.83** | **+3.8%** | **+0.036%** |
+
+**Winner: raw + gated_resnet.** The gated_resnet's learned affine term (mDMD) represents the
+linear drift *exactly* with the MLP gated off (α≈−10), so growth rate and extrapolation are
+near-perfect. resnet-vs-gated on YJ were identical (~2.54) — the gate only helps once raw
+restores linearity for the affine to capture.
+
+**New toggle: `network.det_arch`** = `resnet` | `gated_resnet` (wired in OU, GBM, NLD;
+`getattr(due.networks.fcn, det_arch)`). Default `resnet`.
+
+**OU corollary.** OU was *already* raw (`normalization: none`) — which is exactly why its
+Phase 1 was already good (fixed point ~1.21). OU's mean is also affine, so raw + gated_resnet
+is being tested to tighten 1.21→~1.20. OU has *no* coordinate tension (constant diffusion →
+raw serves both phases).
+
+**Open tension (the real remaining issue).** Raw fixes GBM's *mean* but Phase 2's *diffusion*
+needs YJ to tame the multiplicative (∝x²) noise. A single coordinate can't obviously do both.
+Decisive next test: run the **full `GBM.py` in raw** and inspect effective drift/diffusion —
+- diffusion survives raw ⇒ raw is simply GBM's setting, done;
+- diffusion degrades at high x ⇒ must **decouple coordinates** (D̃ raw for the linear mean,
+  S̃ in YJ for the variance) — a real change to the SDE model, only if this run forces it.
+
+**Status.** GBM Phase-1 mean solved (raw + gated_resnet, per-step bias ~0.036%). Phase-2
+raw-vs-YJ coordinate question is the open item. `phase1_loss_space`/J-reweighting removed as a
+confirmed dead end.

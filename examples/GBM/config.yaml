@@ -9,7 +9,7 @@ dtype: single
 data:
     problem_dim: 1
     memory: 0
-    normalization: "yeojohnson"   # the fix: log-like transform discovered from data (lambda~-0.4)
+    normalization: "none"   # raw units. "yeojohnson" = variance-stabilised (needed by Phase-2 diffusion); "none" = raw (keeps GBM's mean map linear for Phase-1)
 
 network:
     depth: 3
@@ -19,7 +19,7 @@ network:
     activation: "gelu"
     latent_dim: 1
     condition_on_state: true
-    det_arch: "resnet"   # Phase-1 D_theta architecture: "resnet" or "gated_resnet"
+    det_arch: "gated_resnet"   # Phase-1 D_theta architecture: "resnet" or "gated_resnet"
 
 training:   # Phase 1 — deterministic ResNet D_theta (learned, multi-step)
     device: "cpu"

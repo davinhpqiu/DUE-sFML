@@ -17,7 +17,7 @@ network:
     activation: "gelu"
     latent_dim: 1           # dim(z)=dim(x) (GAN-paper convention); leaner input -> less spurious x-tilt in the drift
     condition_on_state: true  # Generator takes (x,z), Critic takes (x0,y1:L)
-    det_arch: "resnet"   # Phase-1 D_theta architecture: "resnet" or "gated_resnet"
+    det_arch: "gated_resnet"   # Phase-1 D_theta architecture: "resnet" or "gated_resnet"
 
 training:   # Phase 1 — deterministic ResNet D_theta
     device: "cpu"
