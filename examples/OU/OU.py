@@ -82,7 +82,9 @@ if conf_train.get("use_oracle_det", False):
     _os.makedirs(conf_train["save_path"], exist_ok=True)
     torch.save(det_net, conf_train["save_path"] + "/model")
 else:
-    det_net = due.networks.fcn.resnet(vmin, vmax, conf_net)
+    _arch = conf_net.get("det_arch", "resnet")
+    print(f"Phase-1 architecture: {_arch}")
+    det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
     phase1_model = due.models.ODE(trainX, trainY, det_net, conf_train)
     phase1_model.train()
     phase1_model.save_hist()

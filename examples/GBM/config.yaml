@@ -19,6 +19,7 @@ network:
     activation: "gelu"
     latent_dim: 1
     condition_on_state: true
+    det_arch: "resnet"   # Phase-1 D_theta architecture: "resnet" or "gated_resnet"
 
 training:   # Phase 1 — deterministic ResNet D_theta (learned, multi-step)
     device: "cpu"

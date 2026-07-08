@@ -42,8 +42,10 @@ conf_net["seq_len"] = trainY.shape[-1]   # L = 40
 print(f"Normalization: {data_loader.normalization}  (lambda={float(NZ.lam[0]):.3f})")
 print(f"trainX: {trainX.shape},  trainY: {trainY.shape}")
 
-# Train Phase 1 — gated_resnet
-det_net = due.networks.fcn.gated_resnet(vmin, vmax, conf_net)
+# Train Phase 1 — D_theta architecture from config ("resnet" | "gated_resnet")
+_arch = conf_net.get("det_arch", "resnet")
+print(f"Phase-1 architecture: {_arch}")
+det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
 phase1_model = due.models.ODE(trainX, trainY, det_net, conf_train)
 phase1_model.train()
 phase1_model.save_hist()

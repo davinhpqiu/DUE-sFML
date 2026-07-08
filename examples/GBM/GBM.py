@@ -47,8 +47,10 @@ conf_net["sequence_length"] = trainY.shape[-1]
 NZ = data_loader.normalizer   # fitted Yeo-Johnson (or minmax) transform
 print(f"Normalization: {data_loader.normalization}  (lambda={float(NZ.lam[0]):.3f})")
 
-# ---- Phase 1: deterministic sub-map D_theta ----
-det_net = due.networks.fcn.resnet(vmin, vmax, conf_net)
+# ---- Phase 1: deterministic sub-map D_theta (architecture from config) ----
+_arch = conf_net.get("det_arch", "resnet")
+print(f"Phase-1 architecture: {_arch}")
+det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
 phase1 = due.models.ODE(trainX, trainY, det_net, conf_train)
 phase1.train()
 phase1.save_hist()

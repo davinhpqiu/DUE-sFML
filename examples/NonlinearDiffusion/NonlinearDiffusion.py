@@ -36,7 +36,9 @@ NZ = data_loader.normalizer
 print(f"Normalization: {data_loader.normalization} (lambda={float(NZ.lam[0]):.3f})")
 
 # ---- Phase 1 ----
-det_net = due.networks.fcn.resnet(vmin, vmax, conf_net)
+_arch = conf_net.get("det_arch", "resnet")
+print(f"Phase-1 architecture: {_arch}")
+det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
 phase1 = due.models.ODE(trainX, trainY, det_net, conf_train)
 phase1.train(); phase1.save_hist()
 det_net = torch.load(conf_train["save_path"] + "/model", map_location=conf_train["device"], weights_only=False)

@@ -37,8 +37,10 @@ trainX_p1, trainY_p1, test_data, vmin, vmax = data_loader.load_sequence(
 # trainX_p1: (N, d) normalised x0 ; trainY_p1: (N, d, L) normalised x1..xL
 conf_net["sequence_length"] = trainY_p1.shape[-1]
 
-# Train Phase 1
-det_net = due.networks.fcn.gated_resnet(vmin, vmax, conf_net)
+# Train Phase 1 — D_theta architecture from config ("resnet" | "gated_resnet")
+_arch = conf_net.get("det_arch", "resnet")
+print(f"Phase-1 architecture: {_arch}")
+det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
 phase1_model = due.models.ODE(trainX_p1, trainY_p1, det_net, conf_train)
 phase1_model.train()
 phase1_model.save_hist()
