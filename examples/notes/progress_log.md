@@ -51,10 +51,12 @@ difference is the data-derived normalization; nothing assumes the governing equa
 (Removed: the `phase1_loss_space` J-reweighting experiment — dead end, see Part 15.)
 
 ### Next
-**GBM Phase-1 mean solved by raw units + gated_resnet (Part 15).** Decisive open test: run the
-full `GBM.py` in raw and check whether Phase-2 diffusion survives without YJ — if not, decouple
-coordinates (D̃ raw / S̃ YJ). Then the nonlinear / double-well / non-Gaussian / 2D examples
-(each stresses a different component: D̃ curvature, generator multimodality/skew, dimension).
+**Decouple tried and REJECTED (Part 16):** raw Phase-1 wrapped into YJ transfers the
+deterministic backbone (det_rollout 3.82) but blows up the full model (mean +68%, std ~7×) —
+coupled YJ (mean 3.5) stays best; the "undershooting" YJ D̃ is a *feature* (pre-compensates the
+noise Jensen lift). Decouple is OFF but kept (`phase1_normalization` commented; `WrappedDet`).
+**Jensen center-correction (Part 17) implemented**, config key `gan.jensen_correction: true`.
+Awaiting run results: expected mean ~3.5→~3.69. Then nonlinear / double-well / non-Gaussian / 2D.
 
 ---
 
@@ -812,3 +814,87 @@ Decisive next test: run the **full `GBM.py` in raw** and inspect effective drift
 **Status.** GBM Phase-1 mean solved (raw + gated_resnet, per-step bias ~0.036%). Phase-2
 raw-vs-YJ coordinate question is the open item. `phase1_loss_space`/J-reweighting removed as a
 confirmed dead end.
+
+---
+
+## Part 16 — Decoupled Phase-1 (raw D̃ wrapped into YJ): built, ran, and it makes the full model WORSE (key negative result)
+
+**Built (modular, toggle-gated, core trainers untouched).** New `due/networks/wrapped_det.py`
+`WrappedDet`: sandwiches a raw-trained D̃ between the Phase-2 transforms,
+`D_wrapped(u) = T(D_raw(T^{-1}(u)))`, so it drops into the (unchanged) SDE model as a
+YJ-coordinate det-net. Config key `data.phase1_normalization` (absent/==normalization ⇒
+coupled; else decouple). `GBM.py` guarded branch loads raw for Phase 1, wraps into YJ for
+Phase 2. Verified: transforms match `Normalizer` (round-trip 8e-16); a perfect raw-linear
+D̃ wrapped + rolled deterministically hits 3.694 vs 3.6945.
+
+**Ran (GBM, raw Phase-1 → YJ Phase-2, 250 + 1000 ep, stable training).**
+- Deterministic backbone TRANSFERRED: `det_rollout` 3.82 (vs coupled 2.54) — the raw linear
+  mean shows through the wrap. GAN stable, increment std matched ~0.3%.
+- **But the full stochastic model got much WORSE:** mean overshoots to **~6.2 (+68%)** vs 3.69,
+  std blows up to **~35 (~7×)** vs ~5, both diverging after t≈0.6. Drift/diffusion overshoot too.
+  Far worse than coupled (mean 3.5, std 4.8).
+
+**Why (the real lesson — centering coordinate vs noise Jensen lift):**
+- Coupled YJ: D̃ = YJ-space conditional mean ⇒ inverts to ~**geometric** mean (~2.55, an
+  undershoot *alone*). The noise, through convex YJ⁻¹, gets a Jensen **lift** to ~3.5
+  (≈arithmetic). Undershoot + lift **cancel** — self-consistent.
+- Decoupled: D̃_raw = **arithmetic** conditional mean (correct alone, hence the clean 3.82
+  deterministic rollout). Now the noise lift **stacks on top** instead of compensating ⇒
+  mean floats up; and the distribution sits in the steeper part of convex YJ⁻¹ ⇒ the same
+  YJ-space noise maps to a much wider physical spread ⇒ variance explodes. Both **compound**
+  over 100 steps (fine early, blow up late).
+
+**Conclusion.** The coupled model's "undershooting" D̃ is a **feature**, not a bug — the
+geometric center pre-compensates the noise's Jensen lift. Decoupling gives a perfect
+deterministic backbone but destroys the mean/noise self-consistency; the raw D̃'s accuracy
+actively *hurts* the full model. **Raw-Phase-1 (Part 15) is a Phase-1-diagnostic truth, it
+does NOT transfer to the full YJ model.** Coupled YJ (mean 3.5, ~5% under) stays the best GBM.
+Decouple turned **OFF** (`phase1_normalization` commented) but the code is kept as a documented
+negative result.
+
+### Next — the Jensen correction (the actual lever for the residual ~5%)
+The residual undershoot is a lognormal/Jensen bias: matching increments in YJ space does not
+pin the *physical* mean. Delta-method: for a step `u' = D̃(u) + S̃` (Var S̃ = σ²(u)),
+`E[x'|x] = E[YJ⁻¹(u')] ≈ YJ⁻¹(D̃(u)) + ½ (YJ⁻¹)''(D̃(u)) σ²(u)`. All three ingredients are
+**equation-agnostic**: `YJ⁻¹` and its 2nd derivative from the fitted normaliser; `σ²(u)` the
+generator's per-state increment variance (measurable); the data's physical conditional mean
+`m(u)` estimated from training pairs. Fix = a per-state **center correction** Δ(u) so the
+model's physical conditional mean matches `m(u)` (one Newton/delta step), applied either at
+prediction (correct D̃(u) before inversion) or as a small correction head. This targets the
+Jensen gap directly WITHOUT breaking the variance channel (unlike raw D̃). **→ Implemented as Part 17.**
+
+---
+
+## Part 17 — Jensen center-correction: implemented (awaiting results)
+
+**Implementation (eval-only, config-toggled).** Added `compute_jensen_delta` function to `GBM.py`.
+After loading the trained models, if `jensen_correction: true`:
+1. **m_x(u)**: bin training pairs (u, physical x') to get the data-estimated physical conditional mean.
+2. **D̃(u)**: evaluate det_net at bin centers.
+3. **σ²_S̃(u)**: sample 2000 generator draws per bin center; compute empirical variance (equation-agnostic: never uses the SDE form).
+4. **δ(u)**: delta-method correction in normalised space:
+   `δ(u) = (m_x(u) − T⁻¹(D̃(u)) − ½(T⁻¹)''(D̃(u))·σ²) / (T⁻¹)'(D̃(u))`
+   where `(T⁻¹)'` and `(T⁻¹)''` are computed analytically from the fitted normaliser (NZ.lam, NZ.smin, NZ.smax).
+   Derivative formulas (x≥0, λ≠0): `(T⁻¹)'(u) = (scale/2)·(λy+1)^(1/λ−1)` and
+   `(T⁻¹)''(u) = (scale/2)²·(1/λ−1)·λ·(λy+1)^(1/λ−2)` where `y = u·scale/2 + (smax+smin)/2`.
+5. **Interpolant**: scipy linear interp, clamped at boundary.
+6. **Applied at eval**: `d = det_net(u) + δ(u)` before each rollout step.
+   Saves `jensen_delta.png` (δ vs u diagnostic).
+
+**Derivative verification** (numpy, synthetic GBM data): analytic (T⁻¹)' and (T⁻¹)'' match
+numerical finite differences to 5 decimal places — formulas confirmed.
+
+**Config**: `gan.jensen_correction: false` (default, no change to existing behaviour); flip to `true` to enable.
+
+**To run:**
+```bash
+# In GBM/config.yaml: set jensen_correction: true
+caffeinate -i python GBM.py   # trains fresh + applies correction in eval
+```
+
+**Expected outcome**: physical mean corrected from ~3.5 toward ~3.69 (~5%→~0%).
+δ(u) should be small (~0.01–0.05 in normalised space), positive (shifting D̃ up slightly).
+If δ is large or has oscillations, the training data binning is too coarse — increase n_bins.
+Std should NOT change materially (δ shifts the center, not the variance channel).
+
+**Status: awaiting run results.**

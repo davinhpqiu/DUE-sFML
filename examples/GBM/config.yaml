@@ -9,7 +9,8 @@ dtype: single
 data:
     problem_dim: 1
     memory: 0
-    normalization: "none"   # raw units. "yeojohnson" = variance-stabilised (needed by Phase-2 diffusion); "none" = raw (keeps GBM's mean map linear for Phase-1)
+    normalization: "yeojohnson"   # Phase-2 coordinate (needs YJ: raw Phase-2 fails — negative traj, constant diffusion)
+    # phase1_normalization: "none"  # DECOUPLE (OFF): raw Phase-1 wrapped into YJ. Negative result — mean +68%, std ~7x (Part 16). Uncomment to re-enable.
 
 network:
     depth: 3
@@ -54,4 +55,5 @@ gan:                # Phase 2 — WGAN-GP (full working pipeline)
     mmd_lambda: 1.0
     center_generator: true
     center_K: 16
+    jensen_correction: false   # Jensen center-correction: shift D̃(u) to pin physical mean (Part 17)
     save_path: "./gan_model"

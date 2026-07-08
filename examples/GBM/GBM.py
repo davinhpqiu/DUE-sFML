@@ -19,6 +19,7 @@ Run:  python GBM.py
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
 from yaml import safe_load
 from pathlib import Path
 import sys
@@ -40,21 +41,40 @@ conf_gan["dtype"] = config_raw["dtype"]
 conf_gan["device"] = conf_train["device"]
 conf_gan["latent_dim"] = conf_net["latent_dim"]
 
-# ---- data ----
+# ---- data (Phase-2 coordinate) ----
 data_loader = due.datasets.sde.sde_dataset(conf_data)
 trainX, trainY, test_data, vmin, vmax = data_loader.load_sequence("GBM_train.mat", "GBM_test.mat")
 conf_net["sequence_length"] = trainY.shape[-1]
-NZ = data_loader.normalizer   # fitted Yeo-Johnson (or minmax) transform
-print(f"Normalization: {data_loader.normalization}  (lambda={float(NZ.lam[0]):.3f})")
+NZ = data_loader.normalizer   # fitted Phase-2 transform (Yeo-Johnson / minmax)
+print(f"Phase-2 normalization: {data_loader.normalization}  (lambda={float(NZ.lam[0]):.3f})")
+
+# Optional DECOUPLE: train Phase-1 D_theta in a different coordinate (e.g. raw "none",
+# where GBM's linear mean stays linear) and wrap it back into the Phase-2 coordinate.
+# Absent / equal to `normalization` => coupled (original single-coordinate behaviour).
+phase1_norm = conf_data.get("phase1_normalization", data_loader.normalization)
+DECOUPLE = (phase1_norm != data_loader.normalization)
 
 # ---- Phase 1: deterministic sub-map D_theta (architecture from config) ----
 _arch = conf_net.get("det_arch", "resnet")
 print(f"Phase-1 architecture: {_arch}")
-det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
-phase1 = due.models.ODE(trainX, trainY, det_net, conf_train)
-phase1.train()
-phase1.save_hist()
-det_net = torch.load(conf_train["save_path"] + "/model", map_location=conf_train["device"], weights_only=False)
+if DECOUPLE:
+    print(f">>> DECOUPLED Phase 1: train D_theta in '{phase1_norm}', wrap into '{data_loader.normalization}' for Phase 2")
+    conf_data_p1 = dict(conf_data); conf_data_p1["normalization"] = phase1_norm
+    loader_p1 = due.datasets.sde.sde_dataset(conf_data_p1)
+    trainX_p1, trainY_p1, _, vmin_p1, vmax_p1 = loader_p1.load_sequence("GBM_train.mat", "GBM_test.mat")
+    det_raw = getattr(due.networks.fcn, _arch)(vmin_p1, vmax_p1, conf_net)
+    phase1 = due.models.ODE(trainX_p1, trainY_p1, det_raw, conf_train)
+    phase1.train()
+    phase1.save_hist()
+    det_raw = torch.load(conf_train["save_path"] + "/model", map_location=conf_train["device"], weights_only=False)
+    det_net = due.networks.WrappedDet(det_raw, NZ)            # operates in the Phase-2 coordinate
+    torch.save(det_net, conf_train["save_path"] + "/model")   # eval reloads the wrapped map
+else:
+    det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
+    phase1 = due.models.ODE(trainX, trainY, det_net, conf_train)
+    phase1.train()
+    phase1.save_hist()
+    det_net = torch.load(conf_train["save_path"] + "/model", map_location=conf_train["device"], weights_only=False)
 
 # ---- Phase 2: WGAN-GP ----
 generator = due.networks.gan.Generator(conf_net)
@@ -100,14 +120,138 @@ def gen_increment(u, n):
     out = generator(u_rep, z.reshape(n * CENTER_K, LATENT_DIM)).reshape(n, CENTER_K, -1)
     return out[:, 0, :] - out.mean(dim=1)
 
-def stochastic_predict(x0_raw, n_samples, n_steps):
+def stochastic_predict(x0_raw, n_samples, n_steps, delta_fn=None):
+    """
+    Run n_samples trajectories from x0_raw for n_steps.
+    delta_fn: optional callable (u_np: ndarray (n,1)) -> (n,1) ndarray correction to add
+    to D̃(u) in normalised space before each step (Jensen center-correction).
+    """
     u = torch.tensor(to_norm(x0_raw), dtype=torch_dtype, device=device).expand(n_samples, -1)
     traj = [to_phys(u.cpu().numpy())]
     with torch.no_grad():
         for _ in range(n_steps):
-            u = det_net(u) + gen_increment(u, n_samples)
+            d = det_net(u)
+            if delta_fn is not None:
+                corr = torch.tensor(delta_fn(u.cpu().numpy()), dtype=torch_dtype, device=device)
+                d = d + corr
+            u = d + gen_increment(u, n_samples)
             traj.append(to_phys(u.cpu().numpy()))
     return np.stack(traj, axis=1)  # (n_samples, n_steps+1) physical
+
+
+def compute_jensen_delta(det_net, generator, trainX, trainY, NZ, conf_net, device,
+                         dtype, center_gen, center_K, n_bins=50, n_sigma_samples=2000):
+    """
+    Compute the Jensen center-correction lookup table δ(u) from training data
+    and the trained generator.  Equation-agnostic: uses only fitted NZ, binned
+    training pairs, and generator samples.
+
+    Returns a callable delta_fn(u_np) -> correction array, same shape as u_np.
+
+    Physics: one step  u' = D̃(u) + S̃(u,z),  x' = T⁻¹(u').
+    Delta-method:
+        E[x'|u] ≈ T⁻¹(D̃(u)) + ½·(T⁻¹)''(D̃(u))·σ²_S̃(u)
+    Correction:
+        δ(u) = (m_x(u) − E_model[x'|u]) / (T⁻¹)'(D̃(u))
+    so that D̃_corr(u) = D̃(u) + δ(u) satisfies E_model[x'|u] = m_x(u).
+    """
+    lam   = float(NZ.lam[0])
+    smin  = float(NZ.smin[0])
+    smax  = float(NZ.smax[0])
+    scale = float(NZ.scale[0])
+    lat   = conf_net["latent_dim"]
+
+    # Analytical derivatives of T⁻¹(u):  T⁻¹(u) = YJ⁻¹(u·scale/2 + (smax+smin)/2)
+    # For x≥0, λ≠0:  (YJ⁻¹)'(y)  = (λy+1)^(1/λ−1)
+    #                 (YJ⁻¹)''(y) = (1/λ−1)·λ·(λy+1)^(1/λ−2)
+    def _dTinv(u_arr):
+        y = 0.5 * u_arr * scale + 0.5 * (smax + smin)
+        return (scale / 2) * (lam * y + 1.0) ** (1.0 / lam - 1)
+
+    def _d2Tinv(u_arr):
+        y = 0.5 * u_arr * scale + 0.5 * (smax + smin)
+        base = lam * y + 1.0
+        return (scale / 2) ** 2 * (1.0 / lam - 1) * lam * base ** (1.0 / lam - 2)
+
+    # 1. Binned physical conditional mean m_x(u) from training data
+    u0    = trainX[:, 0]           # (N,) normalised current state
+    x1    = NZ.inverse(trainY[:, :, 0])[:, 0]  # (N,) physical one-step ahead
+
+    edges   = np.percentile(u0, np.linspace(0, 100, n_bins + 1))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    m_x     = np.full(n_bins, np.nan)
+    for i in range(n_bins):
+        mask = (u0 >= edges[i]) & (u0 <= edges[i + 1])
+        if mask.sum() > 20:
+            m_x[i] = x1[mask].mean()
+
+    # 2. D̃(u) at bin centers
+    det_net.eval()
+    with torch.no_grad():
+        u_t = torch.tensor(centers[:, None].astype(np.float32), dtype=dtype, device=device)
+        Du  = det_net(u_t).cpu().numpy()[:, 0]   # (n_bins,)
+
+    # 3. σ²_S̃(u) from generator at bin centers (equation-agnostic: just sample it)
+    sig2 = np.zeros(n_bins)
+    generator.eval()
+    with torch.no_grad():
+        for i in range(n_bins):
+            u_i = torch.tensor([[centers[i]]], dtype=dtype, device=device).expand(n_sigma_samples, -1)
+            if not center_gen:
+                z   = torch.randn(n_sigma_samples, lat, device=device, dtype=dtype)
+                s   = generator(u_i, z).cpu().numpy()[:, 0]
+            else:
+                z   = torch.randn(n_sigma_samples, center_K, lat, device=device, dtype=dtype)
+                ur  = u_i.unsqueeze(1).expand(-1, center_K, -1).reshape(n_sigma_samples * center_K, 1)
+                out = generator(ur, z.reshape(n_sigma_samples * center_K, lat))
+                out = out.reshape(n_sigma_samples, center_K, -1)
+                s   = (out[:, 0, :] - out.mean(dim=1)).cpu().numpy()[:, 0]
+            sig2[i] = float(s.var())
+
+    # 4. Delta-method model mean and correction
+    ok = ~np.isnan(m_x)
+    model_mean    = NZ.inverse(Du[:, None])[:, 0] + 0.5 * _d2Tinv(Du) * sig2
+    delta_vals    = np.where(ok, (m_x - model_mean) / _dTinv(Du), 0.0)
+
+    # Diagnostic printout
+    mean_gap_pct  = float(np.abs((model_mean[ok] - m_x[ok]) / m_x[ok]).mean() * 100)
+    mean_delta    = float(np.abs(delta_vals[ok]).mean())
+    print(f"\n[Jensen correction] gap before: {mean_gap_pct:.2f}%,  mean |δ|: {mean_delta:.5f}")
+
+    # 5. Smooth interpolant (linear, clamp at boundary — don't extrapolate corrections)
+    uc_ok = centers[ok]; dv_ok = delta_vals[ok]
+    interp = interp1d(uc_ok, dv_ok, kind='linear',
+                      bounds_error=False, fill_value=(dv_ok[0], dv_ok[-1]))
+
+    def _delta_fn(u_np):
+        """u_np: (n, 1) ndarray in normalised space → (n, 1) correction."""
+        return interp(u_np[:, 0])[:, None].astype(np.float32)
+
+    # Save diagnostic: δ(u) vs u
+    u_plot = np.linspace(uc_ok[0], uc_ok[-1], 200)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(u_plot, interp(u_plot), 'b-', label='δ(u) interpolant')
+    ax.scatter(uc_ok, dv_ok, c='r', s=20, zorder=3, label='bin estimates')
+    ax.axhline(0, c='k', lw=0.8, ls='--')
+    ax.set_xlabel('u (normalised)'); ax.set_ylabel('δ(u)')
+    ax.set_title('Jensen center-correction δ(u)')
+    ax.legend(); plt.tight_layout()
+    plt.savefig(save_path + "/jensen_delta.png", dpi=150); plt.close()
+    print("[Jensen correction] saved jensen_delta.png")
+
+    return _delta_fn
+
+# ---- Jensen center-correction (config-toggled, default off) ----
+JENSEN = bool(conf_gan.get("jensen_correction", False))
+delta_fn = None
+if JENSEN:
+    print("\n>>> Jensen center-correction ON — computing δ(u) table ...")
+    delta_fn = compute_jensen_delta(
+        det_net, generator, trainX, trainY, NZ,
+        conf_net, device, torch_dtype,
+        center_gen=CENTER_GEN, center_K=CENTER_K,
+        n_bins=50, n_sigma_samples=2000,
+    )
 
 t_arr = np.arange(N_STEPS + 1) * DT
 
@@ -128,7 +272,7 @@ print("Saved det_rollout.png")
 
 # ---- ensemble ----
 print("Running stochastic prediction ...")
-ens = stochastic_predict(X0_TEST, N_SAMPLES, N_STEPS)
+ens = stochastic_predict(X0_TEST, N_SAMPLES, N_STEPS, delta_fn=delta_fn)
 
 # ---- Mean & Std vs analytical lognormal ----
 mean_pred, std_pred = ens.mean(axis=0), ens.std(axis=0)
@@ -162,7 +306,7 @@ print("Saved drift_diffusion.png")
 
 # ---- Conditional distribution one step from x_n = 6 (paper's choice, Fig. 12) ----
 X_COND = 6.0
-cond = stochastic_predict(X_COND, N_SAMPLES, 1)[:, 1]
+cond = stochastic_predict(X_COND, N_SAMPLES, 1, delta_fn=delta_fn)[:, 1]
 # EM one-step: x1 = x0 + mu x0 dt + sigma x0 sqrt(dt) N  -> Normal(x0(1+mu dt), (sigma x0 sqrt dt)^2)
 m_c = X_COND * (1 + MU * DT); s_c = SIGMA * X_COND * np.sqrt(DT)
 xp = np.linspace(cond.min() - 0.01, cond.max() + 0.01, 200)
