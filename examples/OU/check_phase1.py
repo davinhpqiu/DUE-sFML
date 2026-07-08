@@ -10,7 +10,6 @@ Run from examples/OU/ directory:
 """
 
 import numpy as np
-import scipy.io as sio
 import torch
 import matplotlib.pyplot as plt
 from yaml import safe_load
@@ -27,18 +26,16 @@ N_STEPS = 400  # T = 4.0
 
 # Config
 conf_data, conf_net, conf_train = due.utils.read_config("config.yaml")
-conf_net["seq_len"] = conf_data["seq_len"]
 
-# Data
+# Data — same recurrent loader + normaliser OU.py uses (respects config's
+# normalization mode). Fixes the old KeyError (config's data block no longer
+# carries seq_len) and the previous hardcoded min-max normalisation.
 data_loader = due.datasets.sde.sde_dataset(conf_data)
-_, _, _, vmin, vmax = data_loader.load("OU_train.mat", "OU_test.mat")
-
-raw_seqs   = sio.loadmat("OU_train.mat")["trajectories"]
-train_seqs = (2 * (raw_seqs - 0.5 * (vmax[:, :, None] + vmin[:, :, None]))
-              / (vmax[:, :, None] - vmin[:, :, None])).astype(np.float32)
-
-trainX_p1 = train_seqs[:, :, 0]   # (N, d)
-trainY_p1  = train_seqs[:, :, 1:] # (N, d, L)
+trainX_p1, trainY_p1, test_data, vmin, vmax = data_loader.load_sequence(
+    "OU_train.mat", "OU_test.mat"
+)
+# trainX_p1: (N, d) normalised x0 ; trainY_p1: (N, d, L) normalised x1..xL
+conf_net["sequence_length"] = trainY_p1.shape[-1]
 
 # Train Phase 1
 det_net = due.networks.fcn.gated_resnet(vmin, vmax, conf_net)
@@ -51,15 +48,19 @@ device = conf_train["device"]
 det_net = torch.load(conf_train["save_path"] + "/model", map_location=device, weights_only=False)
 det_net.eval()
 
-vmin_val = float(vmin.flatten()[0])
-vmax_val = float(vmax.flatten()[0])
-torch_dtype = torch.float32
+torch_dtype = torch.float64 if conf_data["dtype"] == "double" else torch.float32
+
+# Normalise/denormalise via the fitted normaliser (identical to OU.py) so the
+# diagnostics match the trained model's coordinate system in every mode.
+NZ = data_loader.normalizer
 
 def normalize(x):
-    return 2 * (x - 0.5 * (vmax_val + vmin_val)) / (vmax_val - vmin_val)
+    a = np.asarray(x, dtype=np.float64)
+    return NZ.transform(a.reshape(-1, 1)).reshape(a.shape)
 
 def denormalize(x):
-    return x * 0.5 * (vmax_val - vmin_val) + 0.5 * (vmax_val + vmin_val)
+    a = np.asarray(x, dtype=np.float64)
+    return NZ.inverse(a.reshape(-1, 1)).reshape(a.shape)
 
 # --- Diagnostic 1: single-step accuracy across a range of x_0 ---
 x0_test_vals = np.linspace(0.4, 2.0, 10)
