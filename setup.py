@@ -14,7 +14,7 @@ setup(
     ],
     packages=find_packages(),
     install_requires=[
-        'torch==2.0.1',
+        'torch>=2.0.1',   # Muon optimizer (get_optimizer / gan.optimizer: "muon") needs torch >= 2.13
         'pyyaml',
         'numpy==1.26.4',
         'scipy',

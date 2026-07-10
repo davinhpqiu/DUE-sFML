@@ -44,7 +44,8 @@ gan:
     batch_size: 1000            # paper: 1000
     n_critic: 5                 # paper: n_ct=5
     gp_lambda: 10               # paper: 10
-    learning_rate: 0.00005      # paper: 5e-5
+    optimizer: "adam"           # "adam" (WGAN-GP betas below) or "muon" (needs torch>=2.13; Muon may want a larger LR)
+    learning_rate: 0.00005      # paper: 5e-5 (tuned for adam). If optimizer: "muon", raise to ~1e-3 — Muon needs a much larger step or the critic won't move
     lr_decay: true              # cosine decay lr -> lr_min over training (paper uses fixed lr)
     lr_min: 0.00001
     adam_beta1: 0.5             # paper: 0.5

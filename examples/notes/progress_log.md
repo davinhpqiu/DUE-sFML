@@ -1084,3 +1084,108 @@ diffusion's shape, but same pooled-loss mechanism.
 | Lognormal §5.3.2 | U(0.1, 2) | x0=1.5 | T=5 | mean/std, G(0.4), drift/diff |
 | 2D-OU §5.4.1 | U([−4,4]×[−3,3]) | x0=(0.3,0.4) | T=5 | mean/std, joint G(0,0) |
 | Oscillator §5.4.2 | U([−1.5,1.5]²) | x0=(0.3,0.4) | T=6.5 | mean/std, marginals G(−0.5,−0.5) |
+
+---
+
+## Part 20 — OU Phase 2 diffusion tilt: grid-based diagnostic + single-step critic attempt
+
+### Context
+Professor wants OU "perfect." Known residual: ~8% std overshoot and state-dependent diffusion tilt
+(upward slope in b̂(x) beyond x≈1.3). Root cause: sequence critic (L=40) converges W-gap→0 before
+per-step variance error is resolved — GP regularization floor > per-step variance correction signal.
+
+### Diagnostic improvement: grid-based drift/diffusion (eq. 4.23)
+Old OU.py used trajectory binning for drift/diffusion — (x_t, Δx_t) pairs pulled from rollout
+trajectories and binned by x value. This caused sparse/empty bins at tail states (OOD zeros and
+scatter). Replaced with the paper's direct method (eq. 4.23):
+- Fixed grid of 100 points x ∈ [0.5, 2.0] (in-distribution range, stationary ~N(1.2, 0.21²))
+- N_Z=20,000 fresh i.i.d. z draws per grid point
+- â(x) = mean(G̃(x,z) − x)/Δ, b̂(x) = std(G̃(x,z))/√Δ
+
+Bug fixed: `normalize(scalar)` returned 0-d array → `torch.tensor(0-d).expand(N_Z, -1)` overflowed.
+Fix: `normalize(np.array([[xg]]))` gives (1,1) shape → expands correctly to (N_Z, 1).
+
+DoubleWell already used this method. OU/DoubleWell both show state-dependent diffusion tilt
+(b̂(x) not flat), confirming this is a real Phase 2 issue, not a binning artifact.
+
+**Key finding**: DoubleWell shows the SAME diffusion non-flatness (0.46–0.53 vs σ=0.5, downward slope
+left-to-right) even with uniform IC U(-2,2). The root cause is not just OOD extrapolation — the
+pooled sequence critic fundamentally cannot enforce constant per-step variance across all states.
+
+### DoubleWell: x0=1.5 update (matching paper protocol)
+Changed from x0=0 (saddle, Phase 1 pathology) to x0=1.5 (stable well, paper protocol):
+- N_STEPS=2000 (T=20) to show inter-well transitions (mean escape time ~7)
+- Inline EM ground truth generated on-the-fly (DW_test.mat was from x0=0)
+- Plot 5: bimodal conditional at T=1 and T=20 — paper's headline result ✓
+- config.yaml: `eval_only: true`
+
+### Normalization: OU switched to minmax
+Changed `normalization: "none"` → `"minmax"` for OU (matching DoubleWell). Rationale:
+standardizes generator inputs; OU with none showed upward diffusion tilt partly because
+x=2.0 is raw-OOD (physical value the generator never saw in training at that raw scale).
+With minmax, x=2.0 → u≈1.02 (barely outside [0,1]) — far better extrapolation posture.
+Requires full retrain.
+
+### Single-step critic — ATTEMPTED (status: pending run)
+**⚠️ IMPORTANT: single-step was the ORIGINAL implementation (Part 1) and was deliberately
+replaced with the sequence critic to match Algorithm 4.1.** Now re-introducing it as an
+experiment to fix the diffusion tilt, with key differences from Part 1:
+- Part 1: single-step with **weak 3×20 critic** (couldn't witness variance → variance collapsed)
+- This attempt: single-step with **strong 4×128 critic** + centering + MMD
+
+**Rationale:** 8% per-step variance error → Wasserstein distance over L=40 steps is below the GP
+floor. Single-step critic sees (x_t, Δx_t) directly: 8% variance mismatch is immediately detectable
+with no gradient attenuation through 40 steps.
+
+**Changes made:**
+- `due/models/sde.py`: added `single_step_critic` flag (default False — fully backward compatible).
+  When True: flattens N×L pairs into N*L=400k one-step dataset; fake generation = D(x_t)-x_t+S(x_t,z)
+  (one forward pass, no rollout). Generator update: det_inc in no_grad (frozen), grad flows through S only.
+- `examples/OU/OU.py`: sets `conf_net["sequence_length"] = 1` before Critic construction when flag on
+  (critic input dim = 2d instead of d*(1+L)=41d).
+- `examples/OU/config.yaml`: `single_step_critic: true`, `eval_only: false`, `use_oracle_det: false`.
+
+**To revert to sequence critic:** set `single_step_critic: false` (or remove the key) in config.yaml.
+The sde.py change is backward compatible — no other configs affected.
+
+**Expected outcome:** flatter b̂(x) across the evaluation grid. Watch `dy std real/fake` in training
+logs — should converge tighter than before (was ~8% gap). If variance still tilts, the issue is
+data coverage not the critic architecture.
+
+---
+
+## Part 21 — Muon optimizer toggle (Phase 1 + Phase 2) — targeting the GAN diffusion channel
+
+**Motivation.** Professor's suggestion, and a direct follow-on to **Part 20** (the sequence critic
+converges W-gap→0 before the per-step variance/diffusion is resolved — GP floor > variance signal).
+The residual defect across examples is the **GAN not fully learning the diffusion** (the variance
+channel the critic must witness — cf. the 4×128-critic fix in Part 6, NLD's under-resolved bell in
+Part 14, the OU/DoubleWell diffusion tilt + single-step-critic attempt in Part 20). Try **Muon**
+(orthogonalising optimizer for hidden-layer weight matrices) on the WGAN-GP, especially the
+**critic**, to see if it learns the diffusion better than Adam. Trial on **OU first** (like the
+single-step-critic experiment), available to all examples.
+
+**Added (config-toggled, default `adam` ⇒ byte-identical to before):**
+- `due/utils.py` — `MuonAdamW`: Muon only optimises **2D** weight matrices; its docs require a
+  standard optimiser for every non-2D param (biases, the gated_resnet scalar gate). Wrapper routes
+  by `ndim` (Muon 2D / AdamW rest), drives both, exposes concatenated `param_groups` + `_step_count`
+  so the cosine LR scheduler works unchanged. `get_optimizer` gains a `muon` branch (Phase-1, via
+  `training.optimizer`).
+- `due/models/sde.py` — Phase-2 `opt_G`/`opt_C` switch on `gan.optimizer` (`adam` default / `muon`).
+  Prints `Phase-2 optimizer: <name>`.
+- `examples/{OU,GBM,NLD}/config.yaml` — surfaced `optimizer` key in the `gan:` section (`training:`
+  section already had one for Phase 1). Toggle works for all SDE examples regardless.
+
+**Blocker.** `torch.optim.Muon` needs **torch ≥ 2.13**; `setup.py` pins `torch==2.0.1`. The branch
+raises a clear error otherwise. → upgrade torch (test existing runs after — big jump) OR use a
+single-file Muon backport (lower risk; wire it into the `muon` branch as a fallback).
+
+**Caveats before trusting a result:**
+- **LR:** GAN runs at 5e-5 (tuned for Adam). Muon wants a *much* larger lr (~1e-2); at 5e-5 the
+  critic barely moves and Muon will look bad. **Bump the GAN lr for the muon run** — the #1 knob.
+- Critic (55k params, 128×128) is where Muon is designed to help; generator (921 params) is ~moot.
+  Could add a critic-only Muon toggle if a cleaner test is wanted.
+- WGAN-GP is optimiser-sensitive; treat as an experiment, not an expected win. Weight decay 0.1
+  (Muon default) is aggressive for these tiny nets — tunable in `MuonAdamW`.
+
+**Status:** wired + compiles; **untested** (needs torch ≥ 2.13). Uncommitted.

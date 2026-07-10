@@ -83,7 +83,14 @@ if EVAL_ONLY:
 else:
     if conf_train.get("use_oracle_det", False):
         print(">>> Phase-1 ABLATION: D_theta replaced by the EXACT OU oracle (no Phase-1 training)")
-        det_net = OracleDet(float(vmin.flatten()[0]), float(vmax.flatten()[0]))
+        # OracleDet applies (de)norm internally via h/c. For normalization="none" the
+        # network receives physical x directly, so we need h=1, c=0 (pass vmin=-1, vmax=1).
+        _norm_type = conf_data.get("normalization", "none")
+        if _norm_type == "none":
+            _ov, _ov2 = -1.0, 1.0   # → h=1, c=0: forward(u) = u + θ(μ-u)dt
+        else:
+            _ov, _ov2 = float(vmin.flatten()[0]), float(vmax.flatten()[0])
+        det_net = OracleDet(_ov, _ov2)
         _os.makedirs(conf_train["save_path"], exist_ok=True)
         torch.save(det_net, conf_train["save_path"] + "/model")
     else:
@@ -102,6 +109,10 @@ else:
     )
 
     # Phase 2 — WGAN-GP (Generator + Critic)
+    # When single_step_critic is on, the critic sees (x_t, Δx_t) pairs — input dim = 2d.
+    # Override sequence_length to 1 so the Critic is sized correctly.
+    if conf_gan.get("single_step_critic", False):
+        conf_net["sequence_length"] = 1
     generator = due.networks.gan.Generator(conf_net)
     critic    = due.networks.gan.Critic(conf_net)
 
@@ -257,34 +268,35 @@ plt.close()
 print("Saved mean_std.png")
 
 # Fig 6: Effective Drift and Diffusion Recovery
-# Estimate from the ensemble at each state value using binning
-x_vals  = ensemble[:, :-1].flatten()
-dx_vals = (ensemble[:, 1:] - ensemble[:, :-1]).flatten()
+# Paper eq. (4.23): for each x on a fixed grid, draw N_z fresh z samples and compute
+#   â(x) = E_z[G̃(x,z) - x] / Δ
+#   b̂(x) = Std_z[G̃(x,z)] / √Δ
+# This avoids trajectory binning artifacts (sparse/correlated samples at tail states).
+x_grid = np.linspace(0.5, 2.0, 100)  # in-distribution range (stationary ~N(1.2, 0.21²))
+N_Z = 20_000                          # z draws per grid point
+drift_pred = np.zeros_like(x_grid)
+diff_pred  = np.zeros_like(x_grid)
 
-# Bin by x value
-n_bins = 50
-x_edges = np.linspace(x_vals.min(), x_vals.max(), n_bins + 1)
-x_centers  = 0.5 * (x_edges[:-1] + x_edges[1:])
-drift_pred = np.zeros(n_bins)
-diff_pred  = np.zeros(n_bins)
+with torch.no_grad():
+    for i, xg in enumerate(x_grid):
+        u = torch.tensor(normalize(np.array([[xg]])), dtype=torch_dtype, device=device).expand(N_Z, -1)
+        nxt_norm = det_net(u) + gen_increment(u, N_Z)
+        nxt = denormalize(nxt_norm.cpu().numpy())[:, 0]
+        dx = nxt - xg
+        drift_pred[i] = dx.mean() / DT
+        diff_pred[i]  = np.sqrt(dx.var() / DT)
 
-for i in range(n_bins):
-    mask = (x_vals >= x_edges[i]) & (x_vals < x_edges[i+1])
-    if mask.sum() > 10:
-        drift_pred[i] = dx_vals[mask].mean() / DT
-        diff_pred[i]  = np.sqrt(dx_vals[mask].var() / DT)
-
-drift_true = THETA * (MU - x_centers)
-diff_true  = SIGMA * np.ones_like(x_centers)
+drift_true = THETA * (MU - x_grid)
+diff_true  = SIGMA * np.ones_like(x_grid)
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-axes[0].plot(x_centers, drift_true, 'k-',  label='Analytical')
-axes[0].plot(x_centers, drift_pred, 'r.', label='sFML (binned)')
+axes[0].plot(x_grid, drift_true, 'k-',  label='Analytical')
+axes[0].plot(x_grid, drift_pred, 'r.', ms=5, label='sFML')
 axes[0].set_xlabel('x'); axes[0].set_ylabel('Drift f(x)'); axes[0].legend()
 axes[0].set_title('Effective Drift')
 
-axes[1].plot(x_centers, diff_true, 'k-',  label='Analytical')
-axes[1].plot(x_centers, diff_pred, 'r.', label='sFML (binned)')
+axes[1].plot(x_grid, diff_true, 'k-',  label='Analytical')
+axes[1].plot(x_grid, diff_pred, 'r.', ms=5, label='sFML')
 axes[1].set_xlabel('x'); axes[1].set_ylabel('Diffusion g(x)'); axes[1].legend()
 axes[1].set_title('Effective Diffusion')
 

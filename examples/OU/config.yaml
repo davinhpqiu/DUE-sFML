@@ -1,5 +1,5 @@
 seed: 0
-eval_only: false   # set true to skip training and load saved models for eval only
+eval_only: false  # set true to skip training and load saved models for eval only
 
 dtype: single
 
@@ -10,7 +10,7 @@ dtype: single
 data:
     problem_dim: 1
     memory: 0
-    normalization: "none"       # paper does not normalize. options: "none" | "minmax" | "yeojohnson"
+    normalization: "minmax"       # paper does not normalize. options: "none" | "minmax" | "yeojohnson"
 
 network:
     depth: 3                    # paper: 3x20 for generator and D_theta
@@ -22,7 +22,7 @@ network:
     condition_on_state: true    # generator: (x,z) -> dy;  critic: (x0, y1:L) -> score
     det_arch: "gated_resnet"    # options: "resnet" | "gated_resnet"
                                 # gated_resnet: D(x) = x + Affine(x) + sigmoid(a)*MLP(x), zero-init.
-                                # paper uses plain resnet.
+                                # paper uses plain resnet
 
 training:
     device: "cpu"
@@ -34,7 +34,7 @@ training:
     learning_rate: 0.001
     verbose: 50
     loss: "mse"
-    use_oracle_det: false       # true = replace D_theta with exact OU map (ablation only)
+    use_oracle_det: false      # true = replace D_theta with exact OU map (ablation only)
     phase1_single_step: false   # false = multi-step rollout loss (paper eq. 4.11)
     save_path: "./det_model"
 
@@ -43,7 +43,8 @@ gan:
     batch_size: 1000            # paper: 1000
     n_critic: 5                 # paper: n_ct=5
     gp_lambda: 10               # paper: 10
-    learning_rate: 0.00005      # paper: 5e-5
+    optimizer: "muon"           # "adam" (WGAN-GP betas) or "muon" (critic on 2D weights; needs torch>=2.13; Muon wants a LARGER lr)
+    learning_rate: 0.001      # 1e-3 for muon (paper/adam use 5e-5; Muon needs a much larger step). Cosine-decays to lr_min below.
     lr_decay: true              # cosine decay lr -> lr_min over training (paper uses fixed lr)
     lr_min: 0.00001
     adam_beta1: 0.5             # paper: 0.5
@@ -58,4 +59,6 @@ gan:
     center_generator: true      # hard-center S: S_c(x,z0) = S(x,z0) - mean_k S(x,zk)
                                 # forces generator zero-mean per state; not in paper
     center_K: 16                # Monte Carlo draws for per-state mean in centering
+    single_step_critic: false    # critic sees (x_t, Δx_t) pairs instead of L-step sequences
+                                # gives direct signal on per-step variance, no gradient attenuation
     save_path: "./gan_model"

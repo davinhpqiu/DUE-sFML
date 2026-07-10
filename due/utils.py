@@ -392,6 +392,53 @@ def get_activation(name):
     else:
         raise ValueError(f'unknown or unsupported activation function: {name}')
         
+class MuonAdamW:
+    """Combined optimizer for Muon (requires torch >= 2.13).
+
+    Muon only optimizes 2D weight matrices of hidden layers; its docs require a standard
+    optimizer for every non-2D parameter (biases, and scalars such as the gated_resnet
+    gate `alpha`). This wrapper routes params by `ndim` — Muon for 2D, AdamW for the rest —
+    and drives both, exposing the standard optimizer API plus a concatenated `param_groups`
+    so LR schedulers (get_schedule) work unchanged.
+
+    `lr` is used for the Muon (2D) group; the AdamW (non-2D) group uses `adamw_lr`
+    (defaults to `lr`). Weight decay defaults to Muon's 0.1 for the 2D group, 0.0 for
+    biases/scalars. Tune here if needed.
+    """
+    def __init__(self, model, lr, adamw_lr=None, weight_decay=0.1):
+        params       = [p for p in model.parameters() if p.requires_grad]
+        muon_params  = [p for p in params if p.ndim == 2]
+        other_params = [p for p in params if p.ndim != 2]
+        adamw_lr = lr if adamw_lr is None else adamw_lr
+        self.optimizers = []
+        if muon_params:
+            self.optimizers.append(
+                torch.optim.Muon(muon_params, lr=lr, weight_decay=weight_decay))
+        if other_params:
+            self.optimizers.append(
+                torch.optim.AdamW(other_params, lr=adamw_lr, weight_decay=0.0))
+        self._step_count = 0   # for torch LRScheduler compatibility (it wraps .step)
+
+    @property
+    def param_groups(self):
+        return [g for opt in self.optimizers for g in opt.param_groups]
+
+    def zero_grad(self, set_to_none=True):
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        for opt in self.optimizers:
+            opt.step()
+
+    def state_dict(self):
+        return {'optimizers': [opt.state_dict() for opt in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        for opt, sd in zip(self.optimizers, state_dict['optimizers']):
+            opt.load_state_dict(sd)
+
+
 def get_optimizer(name, model, lr):
 
     if name in ['adam', 'Adam', 'ADAM']:
@@ -402,6 +449,11 @@ def get_optimizer(name, model, lr):
         return torch.optim.AdamW(model.parameters(), lr=lr)
     elif name in ['SGD', 'sgd', 'Sgd']:
         return torch.optim.SGD(model.parameters(), lr=lr)
+    elif name in ['muon', 'Muon', 'MUON']:
+        if not hasattr(torch.optim, 'Muon'):
+            raise ValueError('torch.optim.Muon requires PyTorch >= 2.13 — upgrade torch '
+                             '(or install a Muon backport).')
+        return MuonAdamW(model, lr)
     else:
         raise ValueError(f'unknown or unsupported optimizer: {name}')
         

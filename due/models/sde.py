@@ -6,6 +6,8 @@ import numpy as np
 import torch
 from numpy import savetxt
 
+from ..utils import MuonAdamW
+
 
 class SDE:
     """
@@ -73,6 +75,11 @@ class SDE:
         #   center_K is a Monte-Carlo accuracy setting, not a tuned knob.
         self.center_generator = config.get("center_generator", False)
         self.center_K = int(config.get("center_K", 16))
+        # single_step_critic: when True the critic sees individual (x_t, Δx_t) pairs
+        # instead of full L-step sequences. This gives the critic direct signal on
+        # per-step conditional variance with no gradient attenuation through L steps.
+        self.single_step_critic = config.get("single_step_critic", False)
+
         self.best_checkpoint_score = float("inf")
         self.best_checkpoint_epoch = None
 
@@ -90,12 +97,21 @@ class SDE:
         lr = config["learning_rate"]
         beta1 = config["adam_beta1"]
         beta2 = config["adam_beta2"]
-        self.opt_G = torch.optim.Adam(
-            self.generator.parameters(), lr=lr, betas=(beta1, beta2)
-        )
-        self.opt_C = torch.optim.Adam(
-            self.critic.parameters(), lr=lr, betas=(beta1, beta2)
-        )
+        # Phase-2 optimizer toggle: "adam" (default, WGAN-GP betas) or "muon"
+        # (Muon on 2D weight matrices + AdamW on biases; needs torch >= 2.13).
+        self.optimizer_name = config.get("optimizer", "adam")
+
+        def _make_opt(module):
+            if self.optimizer_name in ("muon", "Muon", "MUON"):
+                if not hasattr(torch.optim, "Muon"):
+                    raise ValueError("torch.optim.Muon requires PyTorch >= 2.13 "
+                                     "(upgrade torch, or install a Muon backport).")
+                return MuonAdamW(module, lr)
+            return torch.optim.Adam(module.parameters(), lr=lr, betas=(beta1, beta2))
+
+        self.opt_G = _make_opt(self.generator)
+        self.opt_C = _make_opt(self.critic)
+        print(f"Phase-2 optimizer: {self.optimizer_name}")
         # Phase-2 cosine LR decay (from the 2022 GAN paper): shrinking the step size
         # over training damps the minimax oscillation (Robbins-Monro), which the
         # un-centered generator's weakly-damped mean direction needs to converge.
@@ -112,7 +128,16 @@ class SDE:
         states = torch.cat([self.trainX.unsqueeze(-1), self.trainY], dim=-1)
         self.real_increments = states[..., 1:] - states[..., :-1]
 
-        dataset = torch.utils.data.TensorDataset(self.trainX, self.real_increments)
+        if self.single_step_critic:
+            # Flatten all N*L consecutive (x_t, Δx_t) pairs from training sequences.
+            # states: (N, d, L+1) → x_flat: (N*L, d)
+            # real_increments: (N, d, L) → dy_flat: (N*L, d)
+            x_flat  = states[..., :-1].permute(0, 2, 1).reshape(-1, self.output_dim)
+            dy_flat = self.real_increments.permute(0, 2, 1).reshape(-1, self.output_dim)
+            dataset = torch.utils.data.TensorDataset(x_flat, dy_flat)
+        else:
+            dataset = torch.utils.data.TensorDataset(self.trainX, self.real_increments)
+
         self.train_loader = torch.utils.data.DataLoader(
             dataset, batch_size=self.bsize, shuffle=True, drop_last=True
         )
@@ -299,7 +324,12 @@ class SDE:
                 y_real_batch = y_real_batch.to(self.device)
 
                 with torch.no_grad():
-                    y_fake_batch = self.generate_increment_sequence(x0_batch)
+                    if self.single_step_critic:
+                        # One-step fake: D(x_t) - x_t + S(x_t, z)
+                        det_inc = self.det_net(x0_batch) - x0_batch
+                        y_fake_batch = det_inc + self._stochastic_increment(x0_batch)
+                    else:
+                        y_fake_batch = self.generate_increment_sequence(x0_batch)
 
                 gp = self.gradient_penalty(x0_batch, y_real_batch, y_fake_batch)
                 score_real = self.critic(x0_batch, y_real_batch).mean()
@@ -324,7 +354,12 @@ class SDE:
                 totals["fake_increment_mean"] += y_fake_batch.mean().item()
 
                 if self.critic_steps % self.n_critic == 0:
-                    y_fake_for_g = self.generate_increment_sequence(x0_batch)
+                    if self.single_step_critic:
+                        with torch.no_grad():
+                            det_inc = self.det_net(x0_batch) - x0_batch
+                        y_fake_for_g = det_inc + self._stochastic_increment(x0_batch)
+                    else:
+                        y_fake_for_g = self.generate_increment_sequence(x0_batch)
                     score_fake_for_g = self.critic(x0_batch, y_fake_for_g).mean()
                     loss_G = -score_fake_for_g
                     # Optional MMD regulariser: match the whole increment distribution
@@ -422,7 +457,10 @@ class SDE:
         print()
         print("Number of epochs:", self.nepochs)
         print("Batch size:      ", self.bsize)
-        print("Sequence length: ", self.sequence_length)
+        if self.single_step_critic:
+            print("Critic mode:      single-step (x_t, Δx_t) pairs — no rollout")
+        else:
+            print("Critic mode:      sequence (L=%d steps)" % self.sequence_length)
         print("n_critic:        ", self.n_critic)
         print("GP lambda:       ", self.gp_lambda)
         print("Batches / epoch: ", len(self.train_loader))
