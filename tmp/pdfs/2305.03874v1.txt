@@ -1,0 +1,1933 @@
+
+
+===== PAGE 1 =====
+LEARNING STOCHASTIC DYNAMICAL SYSTEM VIA FLOW MAP
+OPERATOR
+YUAN CHEN ∗ AND DONGBIN XIU ∗ ∗
+Abstract. We present a numerical framework for learning unknown stochastic dynamical sys-
+tems using measurement data. Termed stochastic ﬂow map learning (sFML), the new framework is
+an extension of ﬂow map learning (FML) that was developed for learning deterministic dynamical
+systems. For learning stochastic systems, we deﬁne a stochastic ﬂow map that is a superposition
+of two sub-ﬂow maps: a deterministic sub-map and a stochastic sub-map. The stochastic training
+data are used to construct the deterministic sub-map ﬁrst, followed by the stochastic sub-map. The
+deterministic sub-map takes the form of residual network (ResNet), similar to the work of FML
+for deterministic systems. For the stochastic sub-map, we employ a generative model, particularly
+generative adversarial networks (GANs) in this paper. The ﬁnal constructed stochastic ﬂow map
+then deﬁnes a stochastic evolution model that is a weak approximation, in term of distribution, of
+the unknown stochastic system. A comprehensive set of numerical examples are presented to demon-
+strate the ﬂexibility and eﬀectiveness of the proposed sFML method for various types of stochastic
+systems.
+Key words. Data driven modeling, stochastic dynamical systems, deep neural networks, gen-
+erative adversarial networks, stochastic diﬀerential equations
+MSC codes. 60H10, 60H35, 62M45, 65C30
+1. Introduction. In the recent years, data-driven modeling of unknown dynam-
+ical systems has become a prominent area of research among the scientiﬁc computing
+community. Methods for modeling various problems have been developed. See, for
+example, [5, 28, 32, 24, 21, 34, 35, 31], among many others. Most of the work focused
+on deterministic problems, as modeling stochastic systems using noisy data poses
+additional challenges.
+For modeling of stochastic systems, most of the existing eﬀorts focus on learning
+Itˆ o-type stochastic diﬀerential equations (SDE). These include Gaussian process ap-
+proximation ([45, 1, 10, 27]), Gaussian mixture distribution model ([20]), deep neural
+networks (DNNs) model ([12, 11, 18, 43, 47]), polynomial approximations ([37, 23]),
+sparsity promoting learning ([4]), reconstruction of the corresponding Fokker-Planck
+equations ([14]), to name a few. Methods based on physics-informed neural networks
+(PINNs) were also developed. For example, the work of [42, 7] seeks to recover the evo-
+lution of the probability density function of the SDEs, while the work of [6] leverages
+PINNs to recover the governing SDE with transition pathway data.
+The focus, as well as the contribution, of this paper is on the development of a nu-
+merical framework for data driven modeling of general stochastic dynamical systems.
+More speciﬁcally, the method presented in this paper is applicable to the learning of
+a wide class of stochastic systems beyond Itˆ o-type SDEs and Gaussian noises. To
+accomplish this, we propose a method to learn a stochastic ﬂow map from the data.
+This is an extension of the deterministic ﬂow map learning (FML), which was ﬁrst
+developed to learn unknown autonomous dynamical systems ([30]), in conjunction
+with residual network (ResNet), and was later extended to non-autonomous systems
+([29]), systems with missing variables ([15]), as well as partial diﬀerential equations
+([40, 8]). For stochastic systems, the mapping between the solutions at diﬀerent time
+∗E-mail addresses:{chen.11050, xiu.16}@osu.edu. Department of Mathematics, The Ohio State
+University, Columbus, OH 43210, USA. Funding: This work was partially supported by AFOSR
+FA9550-22-1-0011.
+1
+arXiv:2305.03874v1  [cs.LG]  5 May 2023
+
+
+===== PAGE 2 =====
+2 YUAN CHEN AND DONGBIN XIU
+instances, i.e., the ﬂow map, is perturbed by an external stochastic inputs, which are
+unknown and often modeled via Wiener process. Consequently, the ﬂow map can not
+be approximated via any deterministic function.
+The proposed stochastic ﬂow map learning (sFML) method seeks to construct a
+stochastic ﬂow map consisting of two components: a deterministic sub-ﬂow map and
+a stochastic sub-ﬂow map. Using the noisy training data, we ﬁrst construct the deter-
+ministic sub-map by ﬁtting a deterministic function to the data. This is accomplished
+via the use of ResNet, in the same manner as FML for learning deterministic dynam-
+ical systems ([30]). This ResNet ﬁtting obviously results in non-negligible mismatch
+to the data, as a deterministic function can not ﬁt noisy data perfectly (unless one
+grossly over-parameterize the function). We then model the mismatch, which is the
+noisy component of the training data, using a stochastic sub-map in the form of a
+generative model. In this paper, we explore the use of generative adversarial networks
+(GANs), which are a class of generative DNN models designed for generating data
+with the same distribution as that of the training data, cf., [17]. While successful for
+problems such as image generation ([3, 36, 22]), text generation ([46, 33]), etc., GANs
+also showed promises in scientiﬁc computing problems. See, for example, inverse
+problems ([41, 25]), SDEs ([42, 7, 43]), uncertainty quantiﬁcation ([44]), to name a
+few. In this paper, we employ Wasserstein GANs with gradient penalty (WGAN-GP)
+([2, 19]) to construct the stochastic sub-map. Upon learning both the deterministic
+sub-map and stochastic sub-map, we obtain the complete stochastic ﬂow map. Using
+this stochastic ﬂow map an evolution operator, we deﬁne an iterative scheme in time
+as a predictive model of the unknown stochastic dynamical system. The resulting
+sFML model is a weak approximation, in distribution, of the unknown stochastic sys-
+tem, and allows us to analyze the long-term system behavior under diﬀerent initial
+conditions (not in the training data set). The eﬀectiveness of the approach is then
+demonstrated via a comprehensive set of numerical examples.
+This article is organized as following: In Section 2, we introduce the setup of
+the problem. In Section 3, we give a brief review of the related materials, including
+the deterministic FML and GANs. The detailed description of the proposed sFML
+method is presented in Section 4, followed by the numerical examples in Section 5.
+We then conclude the paper by a brief summary in Section 6.
+2. Problem Statement. We consider a general stochastic dynamical system,
+(2.1) dxt
+dt (ω) = f(xt,ω ), xt0(ω) ∼ P0,
+where ω ∈ Ω, an event space in a properly deﬁned probability space, represents the
+random inputs, P0 is the distribution for the initial condition xt0, and the solution
+xt := x(ω,t ) : Ω × [0,T ] ↦→ Rd, d ≥ 1, is a d-dimensional stochastic process for
+some ﬁnite time T > 0. The right-hand-side (RHS) f : Rd × Ω ↦→ Rd is unknown.
+Consequently, the solution xt can not be obtained by solving (2.1).
+2.1. Assumptions. We assume the dynamics of (2.1) is well-deﬁned and time-
+homogeneous (cf. [26]). That is, for any ∆ ≥ 0, the following property holds:
+(2.2) P(xs+∆|xs) = P(x∆|x0), s ≥ 0.
+Let Φt,t0(x0) = x(t +t0) be the time independent ﬂow of (2.1). More precisely,
+(2.3) Φ : (Rd × R) × R → Rd × R; Φ((x0,t 0),t ) = (Φt,t0(x0),t +t0).
+
+
+===== PAGE 3 =====
+FLOW MAP LEARNING OF SDE 3
+The time homogeneous assumption (2.2) implies that the ∆-shift ﬂow map from xs to
+xs+∆ produces a conditional distribution that depends only on the time lag ∆ but not
+on the time variable s. Therefore, hereafter we use the following simpliﬁed notation
+for the ﬂow map: For ∆ ≥ 0, s ≥ 0,
+(2.4) G∆ : Rd × R → Rd; xs+∆ = G∆(xs).
+Naturally, we have G0 = Id, the identity function, and
+G∆(xs)∼P(xs+∆|xs) = P(x∆|x0).
+Note that G∆ is equivalent to Φ in (2.3). We merely suppressed its explicit depen-
+dence on the time variable, because its distribution is the conditional distribution that
+depends only on the time lag ∆. Hereafter we shall refer to G∆ the stochastic ﬂow
+map.
+Remark 2.1. If the right-hand-side of (2.1) takes the following form
+(2.5) f(xt,ω ) = a (xt) + b (xt) ˙Wt(ω),
+where a is the drift function, b the diﬀusion function, and Wt a multivariate Wiener
+process, we obtain the classical form of SDE, which is often written as
+(2.6) dxt = a (xt)dt + b (xt)dWt.
+It satisﬁes time-homogeneous assumption (2.2). In this case, our basic assumption
+of f being unknown mounts to the drift a and the diﬀusion b being unknown. Note
+that the discussion in the paper does not require the unknown SDE (2.1) to be in the
+classical form (2.6).
+2.2. Setup and Objective. Our goal is to construct a numerical model for the
+system (2.1), whose governing equations are unknown, by using measurement data of
+xt, such that the dynamics of (2.1) can be accurately simulated by the constructed
+numerical model.
+Suppose observation data of the system states xt are available over a sequence of
+discrete time instances 0 ≤t0 <t 1 <... . For simplicity, we assume the time instances
+are uniformly distributed with a constant time lag, ∆ = tn −tn−1, ∀n ≥ 1. Suppose
+we have observation data of N ≥ 1 number of solution trajectories. That is, for each
+i = 1,...,N , we have the following solution sequence
+(2.7) x
+(
+t(i)
+0
+)
+, x
+(
+t(i)
+1
+)
+,..., x
+(
+t(i)
+Li
+)
+,
+where (Li + 1) is the length of the sequence. This is the i-th solution trajectory, in
+the sense that it contains the solution of (2.1) from the initial condition x(t(i)
+0 ). For
+notational convenience, hereafter we assume each of the trajectories is of the same
+length, i.e., Li ≡L, ∀i.
+Under the time-homogeneous assumption (2.2), the diﬀerences between the time
+instances are important, as opposed to the actual time values. Therefore, we denote
+the available data as a set of N ≥ 1 solution trajectories of length ( L + 1),
+(2.8) X(i) =
+(
+x(i)
+0 , x(i)
+1 ,..., x(i)
+L
+)
+, i = 1,...,N,
+where x(i)
+k = x(t(i)
+k ), 1 ≤i ≤N, 0 ≤k ≤L, and the time variables t(i)
+k are neglected.
+We remark that this is done for more than just notational convenience. It implies
+
+
+===== PAGE 4 =====
+4 YUAN CHEN AND DONGBIN XIU
+that the actual time variables do not need to be recorded in the data set during
+data collection. It makes our proposed method “coordinate free” and have a wider
+applicability in practice. In another word, each data sequence X(i), i = 1,...,N ,
+can be considered as the solutions of the system (2.1) over time instances tk = k∆,
+k = 0,...,L , with an initial condition x(i)
+0 .
+Given a training data set consisting suﬃciently large number N > 1 trajectory
+data (2.8), our goal is to construct a numerical stochastic ﬂow map ˜G∆ as an approx-
+imation to the true (and unknown) stochastic ﬂow map G∆ (2.4). More speciﬁcally,
+we seek
+(2.9) ˜G∆(x)
+d
+≈ G∆(x),
+where
+d
+≈ stands for approximation in distribution. The numerical ﬂow map ˜G∆ thus
+deﬁnes a numerical model such that given an initial condition ˜x0,
+(2.10) ˜xn+1 = ˜G∆(˜xn), n ≥ 0,
+where we use subscript n to denote the solution at time tn = n∆ hereafter. The
+numerical model (2.10) becomes a weak approximation to the true unknown system
+(2.1), in the sense that, given an arbitrary initial condition ˜x0 = x0 ∼ P0,
+(2.11) ˜xn
+d
+≈ xn, n = 1, 2,....
+Naturally, the condition (2.9) can be not accomplished by any deterministic function.
+We therefore propose to develop a stochastic ﬂow map learning method to construct
+˜G∆.
+3. Preliminaries. The proposed stochastic ﬂow map learning (sFML) method
+is an extension of the ﬂow map learning (FML) method for deterministic systems. It
+involves the use of generative models. More speciﬁcally in this paper, we focus on the
+use of generated adversarial networks (GANs). Here, we brieﬂy review the ideas of
+the deterministic FML method and GANs.
+3.1. Deterministic Flow Map Learning. Consider an autonomous system,
+(3.1) dx
+dt = f(x), x ∈ Rd,
+where f : Rd → Rd is not known. Its ﬂow map is a mapping Φ : Rd × R → Rd such
+that Φ(x(t),s ) = x(t +s). Over the uniform time stencils with the constant time lag
+∆ we consider in this paper, the ﬂow map deﬁnes the evolution of the solution
+(3.2) xn+1 = Φ∆(xn),
+where we move the parameter ∆ into the subscript. When the governing equation
+(3.1) is unknown, this evolutionary equation is also unknown.
+The FML method developed in [30] utilizes data to learn the evolutionary relation
+(3.2) by constructing an approximate ﬂow map ˜Φ ≈ Φ∆ such that
+(3.3) ˜xn+1 = ˜Φ∆(˜xn)
+is an accurate approximation to (3.2). This is accomplished by training the approx-
+imate evolution (3.3) to match the training data set (2.8), which are deterministic
+data in this case.
+
+
+===== PAGE 5 =====
+FLOW MAP LEARNING OF SDE 5
+Consider the i-th trajectory data from (2.8), i = 1,...,N . Using x(i)
+0 as the
+initial condition, i.e., ˜x(i)
+0 = x(i)
+0 , the approximate ﬂow map evolution equation (3.3)
+generates a trajectory,
+(3.4) ˜X(i) =
+(
+˜x(i)
+0 , ˜x(i)
+1 ,..., ˜x(i)
+L
+)
+.
+The approximate ﬂow map ˜Φ∆ is then determined by minimizing the mean squared
+loss
+(3.5) min
+N∑
+i=1
+ ˜X(i) − X(i)
+
+2
+F
+,
+where the Frobenius norm becomes vector 2-norm for scalar systems with d = 1.
+The work of [30] proposed the use of residual network (ResNet)
+(3.6) ˜Φ∆ = I + N,
+where I is the identity operator and N : Rd → Rd stands for the mapping operator of
+a standard feedforward fully connected DNN. The minimization of the mean squared
+loss thus becomes a minimization problem for the hyper parameters deﬁning the DNN.
+Once the training is completed, one obtain a predictive model for the underlying
+unknown dynamical system, such that, for a given initial condition x0,
+(3.7) ˜xn+1 = ˜xn + N(˜xn), n = 0, 1,...,
+where ˜x0 = x0. This framework has shown to be highly eﬀective and accurate for
+many systems ([30, 29, 15]).
+3.2. Generative Adversarial Networks. GANs (cf. [16]) are widely used,
+among many other tasks, to generate data with a desired target distribution. Consider
+a target distribution Pr, with observed data xdata ∼ Pr. Let z be random variables
+with a ﬁxed known distribution Pz. For example, a normal distribution. In GANs, one
+deﬁnes a neural network, called generator, G(z,θg) with its hyper parameter set θg to
+map z into a new distribution Pθg. The goal is to tune the parameter θg such that the
+output distribution matches the target distribution Pr . At the same time, one deﬁnes
+another neural network, called discriminator, D(x,θd) with its hyper parameter set
+θd to assign a score to the input x such that it is able to distinguish whether x is from
+the target distribution Pr or the “fake” distribution Pθg.
+The two networksD andG are trained by solving a a zero-sum two-player game.
+The generator G aims to “fool” the discriminator D and let it believe the samples of
+G(z) are from the target distribution Pr. At the same time, the discriminator D aims
+to distinguish the samples from G(z) and the real Pr. The optimization problem can
+be written in the following minimax form:
+(3.8) min
+G
+max
+D
+LGANs(D,G ) := Ex∼Pr[logD(x)] + Ez∼Pz[log(1 −D(G(z)))].
+In this paper, we adopt the popular WGANs ([2]), which trains the discriminator to
+approximate Wasserstein-1 distance between the real and fake samples. The deﬁnition
+of Wasserstein-p distance is:
+(3.9) Wp(µ,ν ) =
+(
+inf
+γ∈Γ(µ,ν)
+E(x,y)∼γd(x,y )p
+)1/p
+, p ≥ 1,
+
+
+===== PAGE 6 =====
+6 YUAN CHEN AND DONGBIN XIU
+where Γ(µ,ν ) is the set of all couplings of µ andν, andd(·, ·) is a metric. More specif-
+ically, we employ WGANs with gradient penalty (WGANs-GP), which introduces a
+penalty on the gradient of the discriminator to enhance numerical stability ([19]). The
+loss function for WGANs-GP is:
+(3.10) LWGANs-GP(D,G ) = E
+˜x∼Pg
+[D(˜x)] − E
+x∼Pr
+[D(x)] +λ E
+ˆx∼Pˆx
+[
+(∥∇ˆxD(ˆx)∥2 − 1)2
+]
+,
+where the distribution Pˆx is deﬁned to sample uniformly along straight lines between
+pairs of points sampled from the data distribution Pr and Pg, and λ ≥ 0 is a penalty
+constant.
+4. Stochastic Flow Map Learning. We now discuss the proposed stochastic
+ﬂow map learning (sFML) method. The method consists of two steps: (1) construction
+of a deterministic sub-ﬂow map to model the averaged dynamics of the unknown
+system; and (2) construction of a stochastic sub-ﬂow map to model the noisy dynamics
+of the unknown system. The two sub-ﬂow maps are learned from the same training
+data set (2.8).
+4.1. Method Description. The solution of the unknown system (2.1) is gov-
+erned by the (unknown) stochastic ﬂow map G∆ (2.4). Its evolution over two con-
+secutive time steps can be decomposed into two parts:
+(4.1) xn+1 = G∆(xn) = E [xn+1|xn] + x′
+n+1,
+where the conditional mean E [xn+1|xn] is a deterministic function of xn and x′
+n+1
+contains the stochastic component. Therefore, we write the stochastic ﬂow map as a
+composition of two parts,
+(4.2) G∆ = D∆ + S∆,
+where
+(4.3) D∆ : Rd × R → Rd = E(xn+1|xn), S∆ : Rd × R → Rd
+are the deterministic part and stochastic part, respectively. Hereafter, we refer to D∆
+as deterministic sub-map, and S∆ as stochastic sub-map. Obviously, neither D∆ nor
+S∆ is known. Figure 1 illustrates the idea of the decomposition.
+Our proposed learning method seeks to construct numerical approximations to
+D∆ and S∆ by using the trajectory data (2.8). That is, we seek to construct a
+numerical stochastic ﬂow map
+(4.4) ˜G∆ = ˜D∆ + ˜S∆,
+where ˜D∆ and ˜S∆ are the approximation to D∆ and S∆, respectively. Speciﬁcally,
+we seek ˜G to be an approximation of G in distribution, in the sense that, for any
+x ∈ Rd,
+(4.5) ˜G∆(x)
+d
+≈ G∆(x).
+4.2. Learning Deterministic Sub-map. Given the trajectory data (2.8), we
+ﬁrst construct a numerical deterministic sub-map
+(4.6) ˜D∆ : Rd × R → Rd
+
+
+===== PAGE 7 =====
+FLOW MAP LEARNING OF SDE 7
+t
+Observed Data
+decompose
+Fig. 1. An illustration of the decomposition of stochastic dynamics into the superposition of a
+smooth dynamics, governed by the conditional expectation, and a noisy dynamics..
+as an accurate approximation of D∆. This is accomplished by ﬁnding a deterministic
+operator such that it generates deterministic trajectories that are the best ﬁt to the
+stochastic training data (2.8).
+Let us consider the i-th trajectory data from (2.8), i = 1,...,N . Using x(i)
+0 as
+the initial condition, the deterministic sub-map generates a deterministic trajectory,
+(4.7) X
+(i)
+=
+(
+¯x(i)
+0 , ¯x(i)
+1 ,..., ¯x(i)
+L
+)
+,
+where ¯x(i)
+0 = x(i)
+0 , and
+(4.8) ¯x(i)
+n+1 = ˜D∆
+(
+¯x(i)
+n
+)
+, n = 0,...,L − 1.
+The deterministic sub-map in our method is deﬁned as the one that minimizes the
+total mis-ﬁt between the deterministic trajectories ¯X(i) and the stochastic training
+trajectories X(i). More speciﬁcally, we use the common mean squared loss as the
+mis-ﬁt measure and ﬁnd ˜D∆ to accomplish
+(4.9) min
+N∑
+i=1
+X
+(i)
+− X(i)
+
+2
+F
+,
+where the Frobenius norm becomes vector 2-norm for scalar systems with d = 1.
+To make the minimization problem tractable, we conﬁne the search for ˜D∆ in
+a ﬁnite dimensional space. This is accomplished by employing a class of functions
+parameterized by a ﬁnite number of parameters. For low-dimensional dynamical
+systems, one may employ a polynomial space. See, for example, [39]. For more
+general systems whose dimensions d may not be small, DNNs have become a more
+popular choice. In this paper, we also utilize DNN as the deterministic sub-map.
+Similarly to the work of deterministic FML ([30]), we employ ResNet structure and
+deﬁne
+(4.10) ˜D∆(·; Θ) := I + N∆(·; Θ),
+where I is the identity matrix of size (d ×d) and N∆(·; Θ) : Rd → Rd is the mapping
+operator of a connected feedforward DNN with its hyperparameter set Θ. Note that
+
+
+===== PAGE 8 =====
+8 YUAN CHEN AND DONGBIN XIU
+Θ is a ﬁnite set, whose cardinality is determined by the width and depth of the DNN.
+The minimization problem (4.9) thus becomes a minimization problem for the DNN
+parameter Θ, i.e.,
+(4.11) min
+Θ
+N∑
+i=1
+L∑
+n=1
+x(i)
+n − ˜D[n]
+∆
+(
+x(i)
+0 ; Θ
+)
+2
+2
+,
+where ˜D[n]
+∆ stands for n times composition of the operator ˜D∆. Upon solving the
+minimization problem, the hyperparameters Θ in the DNN are ﬁxed. We thus neglect
+Θ for notational convenience, unless confusion arises otherwise.
+Note that in the loss function (4.11), the case of L >1 corresponds to the well-
+known multi-step loss, which is known to improve forecast accuracy for time series
+analysis, cf. [38, 9, 13]. It has also been used in FML for improving numerical stability
+of long-term predictions ([15, 8]). Setting L = 1, it is straightforward to see that the
+loss function (4.11) ensures that, for suﬃciently large number of samples N ≫ 1, we
+have
+(4.12) ˜D∆(x0) ≈ E(x1|x0),
+which implies, upon using the time homogeneous assumption (2.2),
+(4.13) ˜D∆(xn) ≈ D∆(xn) = E(xn+1|xn).
+4.3. Learning Stochastic Sub-map. Once the deterministic sub-map ˜D∆ is
+constructed, we proceed to construct the stochastic sub-map ˜S∆ in the numerical
+stochastic ﬂow map (4.4), as an approximation to the exact stochastic sub-map S∆ :
+Rd × R → Rd in (4.3). Note that as the stochastic component of the ﬂow map G∆,
+S∆ is subject to random input that is a function of the time lag ∆ and unknown. In
+order to approximate this unknown random input, we deﬁne a generative model that
+incorporates an explicit random input. More precisely, we deﬁne
+(4.14) ˜S∆ : Rd × R × Rns → Rd, n s ≥ 1,
+where ns deﬁnes the stochastic dimension of the stochastic sub-map. Note that the
+true stochastic dimension of the sub-map S∆ is unknown. Upon choosing a ﬁnite
+numberns ≥ 1, we seek to construct the numerical stochastic ﬂow map
+(4.15) ˜G∆ = ˜D∆ + ˜S∆ : Rd × R × Rns → Rd
+as a weak approximation (in distribution) to the true (unknown) stochastic ﬂow map
+G∆ (2.4). Note that at this point the deterministic sub-map ˜D∆ is ﬁxed, as it is
+already constructed by the procedure in the previous section. The only task is to
+construct the stochastic sub-map ˜S∆.
+To construct the stochastic sub-map ˜S∆, we again utilize the training data set
+(2.8). For each of the i-th trajectory data in the set, i = 1,...,N , we use x(i)
+0 as the
+initial condition and generate
+(4.16) ˆX(i) =
+(
+ˆx(i)
+0 , ˆx(i)
+1 ,..., ˆx(i)
+L
+)
+,
+where ˆx(i)
+0 = x(i)
+0 , and
+(4.17) ˆx(i)
+n+1 = ˜G∆
+(
+ˆx(i)
+n , z(i)
+n
+)
+, n = 0,...,L − 1,
+
+
+===== PAGE 9 =====
+FLOW MAP LEARNING OF SDE 9
+where z(i)
+n ∈ Rns are i.i.d. random variables following a prescribed known distribution.
+For example, unit Gaussian.
+We then minimize the distance between
+{
+ˆX(i)
+}N
+i=1
+and
+{
+X(i)}N
+i=1, where the
+distance function is chosen to measure probability distribution. Since ˜D∆ in ˜G∆ is
+ﬁxed, the minimization procedure thus determines the stochastic sub-map ˜S∆, which
+in turn becomes a minimization problem for the hyperparameters after we express ˜S∆
+in a parameterized family of functions.
+In this paper, we adopt GANs for the construction of the stochastic sub-map ˜S∆.
+Speciﬁcally, we use DNN to represent ˜S∆, i.e.,
+(4.18) ˜S∆ := ˜S∆(x, z; Θ),
+where x ∈ Rd, z ∈ Rns, and Θ represents the hyperparameters in the DNN. Here z
+is a random vector within known distribution. In our examples, we use i.i.d. unit
+normal distribution. The dimension of z,ns ≥ 1, is a choice made by user, in order to
+approximate the true probability space Ω whose dimension is unknown. Consequently,
+the stochastic ﬂow map ˜G∆ = ˜G∆(x, z; Θ) by using (4.15).
+By using the GANs approach described in Section 3.2, the generator is the sto-
+chastic ﬂow map ˜G∆(x, z; Θ), which generates the “fake” data sequence
+{
+ˆX(i)
+}N
+i=1
+in
+(4.16). The generator is expected to minimize the distance between the “fake” data
+ˆX :=
+{
+ˆX(i)
+}N
+i=1
+(4.16) and the training data X :=
+{
+X(i)}N
+i=1 (2.8). To achieve this
+goal, a discriminator network C, which is another DNN with its own hyperparame-
+ters, is trained to distinguish the two sets of data by approximating the Wasserstein-1
+distance (3.9). For the network training, we adopt the WGANs with gradient penalty
+(WGANs-GP), whose loss function (3.10) takes the following form in our case:
+(4.19) L(C, ˜G∆) = E
+˜x∼ ˆX
+[C(˜x)] − E
+x∼X
+[C(x)] +λ E
+ˆx∼P( ˆX,X)
+[
+(∥∇ˆxC(ˆx)∥2 − 1)2
+]
+,
+where P( ˆX, X) is uniform sampling distribution along the straight lines between pairs
+of points from ˆX and X, and λ ≥ 0 is a penalty constant.
+4.4. DNN Structures and Algorithm. In this section, we summarize the
+sFML algorithm and its corresponding DNN structures.
+Given the training data set (2.8), the sFML algorithm consists of the following
+two steps:
+(1) Constructing the deterministic sub-map ˜D∆ by minimizing the loss function
+(4.11). The multi-step loss (when L> 1) requires recurrent use of the deter-
+ministic sub-map ˜D∆, as illustrated in Fig. 2.
+(2) Constructing the stochastic sub-map ˜S∆, which deﬁnes the generator ˜G∆ =
+˜D∆ + ˜S∆. Subsequently, the generator generates the “fake” data ˆX in (4.16)
+via (4.17). In the spirit of ResNet, we write (4.17) in an equivalent form
+(4.20) ˆx(i)
+n+1 = ˆx(i)
+n + ˜G∆
+(
+ˆx(i)
+n , z(i)
+n
+)
+, n = 0,...,L − 1, i = 1,...,N,
+where we use the same notation ˜G∆ here to refer to the core DNN part of
+the operation. Therefore, ˜G∆ corresponds to the diﬀerence ˆyn = ˆxn − ˆxn−1,
+n = 1,...,L .
+
+
+===== PAGE 10 =====
+10 YUAN CHEN AND DONGBIN XIU
+Recurrent Network
+¯x1 ¯x2 ... ¯xL
+¯x0 ˜D∆ ˜D∆ ... ˜D∆
+Fig. 2. An illustration of the recurrent network structure for the deterministic sub-map ˜D∆.
+The generator is illustrated on the left of Fig. 3. The right of Fig. 3 illustrates
+the discriminator C, which is a standard DNN that computes a score s to the
+“fake” data. It also computes a score for the training data X. These are then
+used in the minimization of the loss function (4.19).
+Generate
+z z z
+˜G∆ ˆy1 ˜G∆ ˆy2 ... ˜G∆ ˆyL
++ + +
+ˆx0 ˆx1 ˆx2 ... ˆxL
+Discriminate
+ˆx0 ˆy1:L
+C
+s
+Fig. 3. Left: An illustration of the generator in the stochastic ﬂow map. Right: Discriminator
+that computes a score for the data.
+The algorithm of the sFML method is summarized in Algorithm 4.1.
+4.5. Model Prediction and Analysis. Upon satisfactory training of the DNNs,
+we obtain a predictive sFML model for the underlying unknown SDE. For a given ini-
+tial condition x0,
+(4.21) ˜xn+1 = ˜G∆ (˜xn, zn) = ˜D∆(˜xn) + ˜S∆(˜xn, zn), n = 0, 1, 2...,
+with ˜x0 = x0. The model can be marched forward in time far beyond the length of
+the training data.
+Note that the sFML model resembles the form of the classical SDE (2.6), regard-
+less whether the underlying unknown SDE is in the form of (2.6) or not. In fact, we
+can be re-write the sFML model as
+(4.22) ˜xn+1 = ˆa(˜xn)∆ + ˆb(˜xn)δWn,
+where
+(4.23) ˆa(x) = Ez( ˜G∆(x, z) − x)
+∆ , ˆb(x) = Stdz( ˜G∆(x, z))√
+∆
+,
+and can be considered the eﬀective drift and diﬀusion, respectively. Therefore, if the
+underlying unknown true SDE is of the classical form (2.6), we expect the eﬀective
+
+
+===== PAGE 11 =====
+FLOW MAP LEARNING OF SDE 11
+Algorithm 4.1 Learning SDE via GANs
+Input: Trajectory data of SDE: {(x0, y1,..., yL)(i)}N
+i=1; Deterministic model ˜D∆.
+Parameters: Recurrent lengthL; Noise input dimension Z of generator; Layers and
+neurons each layer, Adam optimizer hyper-parameters β1, β2, base learning rate
+lr of DNN ˜S∆, C with training parameter ΘS and ΘC; Iterations of training critic
+per generator iteration nct; Batch size B and number of batches nB =N/B per
+epoch; Number of training epochs nE; Gradient penalty constant λ.
+Note: In the following algorithm, we apply operator ˜D, ˜S and C by rows when
+imputing a matrix.
+1: for n = 1, 2,...,n E do
+2: for i = 1, 2,...,n B do
+3: Slice ith group of data {(x0, y1,..., yL)(i)}iB
+i=1+(i−1)B; ˆx0 ← x0;
+4: for j = 0, 1,...,L − 1 do
+5: Sample B Z-dimensional random vectors z = {zk}B
+k=1, zk ∼ N (0, I);
+6: ˆyj+1 ← ˜D∆(ˆxj) − ˆxj + ˜S∆(ˆxj, z);
+7: ˆxj+1 ← ˆxj + ˆyj+1; ⊿ Generate fake SDE data
+8: end for
+9: for k = 1, 2,...,B do
+10: Sample nB random numbersϵ = {ϵk}nB
+k=1, ϵk ∼ U (0, 1);
+11: ˜y(k)
+1:L ←ϵky(k)
+1:L + (1 −ϵk)ˆy(k)
+1:L;
+12: P (k)
+C ←
+(∇(x(k)
+0 ,˜y(k)
+1:L)C(x(k)
+0 , ˜y(k)
+1:L)
+
+2
+− 1
+)2
+;
+13: L(k)
+C ← C(x(k)
+0 , ˆy(k)
+1:L) − C(x(k)
+0 , y(k)
+1:L) +λP (k)
+C ;
+14: end for
+15: ΘC ← Adam( 1
+B
+∑B
+k=1L(k)
+C ,lr,β 1,β 2); ⊿ Update Critic
+16: if mod(nB,n ct) = 0 then
+17: for k = 1, 2,...,B do
+18: L(k)
+S ← −C(x(k)
+0 , ˆy(k)
+1:L);
+19: end for
+20: ΘS ← Adam( 1
+B
+∑B
+k=1L(k)
+S ,lr,β 1,β 2); ⊿ Update Generator
+21: end if
+22: end for
+23: end for
+drift and diﬀusion (4.23) of the sFML model (4.21) to be good approximations of the
+true drift and diﬀusion, respectively.
+5. Numerical Results. In this section, we present several numerical examples
+to demonstrate the performance of the proposed sFML method. The examples cover
+the following cases:
+• Linear SDEs. These include an Ornstein-Uhlenbeck (OU) process and a geo-
+metric Brownian motion;
+• Nonlinear SDEs. These include SDEs with exponential and trigonometric
+drift or diﬀusions, as well as the well-known stochastic double-well potential
+problem;
+• SDEs with non-Gaussian noise, including exponential distribution and log-
+normal distribution.
+• Two-dimensional SDEs, which include a 2-dimensional OU process and a
+
+
+===== PAGE 12 =====
+12 YUAN CHEN AND DONGBIN XIU
+stochastically driven harmonic oscillator.
+For all of these problems, the exact SDEs are known. They are used to generate the
+training data sets, which are generated by solving the SDEs with Euler-Maruyama
+method, with initial conditions uniformly distributed in a region (speciﬁed later for
+each example). The SDEs are solved using a time step ∆ = 0 .01 for 100 steps, from
+which we randomly choose a length L = 40 sequence to form our training data set
+(2.8). In other words, the training data are solution sequences of length T = 0.4. Our
+training data set (2.8) consists of N = 10, 000 such trajectories.
+For the DNN structure, we use a simple fully connect feedforward DNN for both
+the deterministic sub-map ˜D∆ (4.10) (see Figure 2) and the discriminator C in Figure
+3 in the generator. In most examples, we use 3 layers, where each layer has 20 nodes.
+The exceptions are the 2-dimensional examples, where each layer has 40 nodes. In
+the training process of the GANs, we follow Algorithm 4.1 and set nct = 5, β1 = 0.5,
+β2 = 0.999, lr = 5 × 10−5. All examples are trained up to 100 , 000 epochs.
+To examine the performance of the constructed sFML models, we provide the
+following ways:
+• Simulated trajectories and their mean and standard deviation, for visual com-
+parisons as well as the basic statistics;
+• Conditional distribution the stochastic ﬂow map ˜G∆, in comparison to that
+of the true ﬂow map G∆;
+• Evolution of the predicted solution distribution at certain times beyond the
+training data time domain.
+• Comparison of the eﬀective drift and diﬀusion (4.23) against the true drift
+and diﬀusion to those of true SDEs.
+5.1. Linear SDEs. For scalar linear SDEs, we present the results for learning
+an OU process and a geometric Brownian motion.
+5.1.1. Ornstein–Uhlenbeck process. We ﬁrst consider the following Orn-
+stein–Uhlenbeck (OU) process,
+(5.1) dxt =θ(µ −xt)dt +σdWt,
+where θ = 1.0, µ = 1.2, and σ = 0.3. The training data are generated by solving the
+SDE with initial conditions uniformly sampled from U(0, 0.25). Some of these samples
+are shown on the left of Figure 4. Upon training the DNNs and creating the sFML
+model for the OU process, we generat simulated trajectories from the learned model
+for up to T = 4.0. On the right of Figure 4, we show the sFML model simulation
+results with an initial conditionx0 = 1.5 for time up toT = 4.0. We also compute the
+mean and standard deviation of the sFML model prediction, averaged over 100 , 000
+simulation samples. The results are shown in Figure 5, along with the reference mean
+and variance from the true OU process. We observe good agreement between the
+learned sFML model and the true model. Note that the agreement goes beyond the
+time horizon of the training data by a factor of 4.
+In Figure 6, we show the recovered eﬀective drift and diﬀusion functions for the
+OU process, by following the procedure (4.23) using 100 , 000 sFML model simula-
+tions. Comparing them to the true drift and diﬀusion, we observe good accuracy of
+the recovered functions, with relative errors on the order of 10 −2. Note that the dis-
+crepancy is relatively larger towards the end points of the comparison domain. This
+is expected because there are far less number of samples in these regions to gather
+highly accurate statistical results. Such a behavior is presented throughout all the ex-
+amples in this paper. The OU process eventually reaches a steady state. In Figure 7,
+
+
+===== PAGE 13 =====
+FLOW MAP LEARNING OF SDE 13
+0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0
+T
+0.0
+0.5
+1.0
+1.5
+2.0
+0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0
+T
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+Fig. 4 . Solutions of the OU process. Left: samples of the training data; Right: simulated
+samples by the sFML model for up to T = 4.0, with an initial condition x0 = 1.5.
+0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0
+T
+1.0
+1.1
+1.2
+1.3
+1.4
+1.5
+1.6 Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+Fig. 5. Mean and standard deviation (STD) of the OU process by the sFML model.
+we plot the histogram for the samples of ˜G∆(0.8), as a comparison of the conditional
+distribution against that of the true stochastic ﬂow map G∆(0.8). Good agreement
+can be observed.
+We conduct further examination of the solution time sequence produced by the
+sFML model. In Figure 8, we present the spectra of the covariance function of the
+simulated sequences by the sFML model, along with that of the true solution sequence
+under the same initial condition. We observe good agreement between the sFML
+model and the true model.
+5.1.2. Geometric Brownian motion. We now consider geometric Brownian
+motion, which, unlike the OU process, does not have steady state. In particular, we
+consider
+(5.2) dxt =µxtdt +σxtdWt,
+
+
+===== PAGE 14 =====
+14 YUAN CHEN AND DONGBIN XIU
+0.8 1.0 1.2 1.4 1.6 1.8 2.0
+x
+0.8
+0.6
+0.4
+0.2
+0.0
+0.2
+0.4
+a(x)
+Reference
+Learned
+0.8 1.0 1.2 1.4 1.6 1.8 2.0
+x
+0.27
+0.28
+0.29
+0.30
+0.31
+0.32
+0.33b(x)
+Reference
+Learned
+Fig. 6. Eﬀective drift and diﬀusion of the OU process. Left: drift a(x); Right: diﬀusion b(x).
+0.65 0.70 0.75 0.80 0.85 0.90 0.95
+x
+0
+2
+4
+6
+8
+10
+12
+14pdf
+Reference
+Learned
+Fig. 7. OU process at steady state: comparison of the conditional distribution of the sFML
+model ˜G∆(0.8) against that of the true model G∆(0.8).
+0 5 10 15 20 25 30 35 40
+Component
+10 3
+10 2
+10 1
+Spectra of Cov Matrix
+Ground Truth
+Prediction
+Fig. 8 . OU process: comparison of covariance matrix spectra of the sFML model solution
+sequence (“Prediction”) against that of the true solution (“Ground Truth”).
+
+
+===== PAGE 15 =====
+FLOW MAP LEARNING OF SDE 15
+where µ and σ are constant parameters. We set µ = 2.0, σ = 1.0 in our test.
+On the left of Figure 9, some samples of the true solutions for the training data
+are shown. These are generated from initial conditions uniformly distributed U(0, 2).
+On the right of Figure 9, we show the simulated solution samples by the trained
+sFML model with an initial condition x0 = 0.5. The mean and STD of the solution
+comparison are shown in Figure 10. Good agreement can be observed. Since this
+geometric Brownian motion grows exponentially fast over time, the simulation is
+stopped at T = 1.0.
+0.0 0.2 0.4 0.6 0.8 1.0
+T
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+0.0 0.2 0.4 0.6 0.8 1.0
+T
+0
+2
+4
+6
+8
+10
+Fig. 9. Solutions of the geometric Brownian motion. Left: samples of true solution for the
+training data; Right: simulated samples by the sFML model with an initial condition x0 = 0.5.
+0.0 0.2 0.4 0.6 0.8 1.0
+T
+0
+2
+4
+6
+8 Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+Fig. 10. Mean and standard deviation of the geometric Brownian motion by the sFML model.
+The eﬀective drift and diﬀusion functions recovered by the sFML model are shown
+in Figure 11. Good agreement with the true drift and diﬀusion can be observed. The
+conditional distribution produced by the stochastic ﬂow map ˜G∆(x) is plotted at
+
+
+===== PAGE 16 =====
+16 YUAN CHEN AND DONGBIN XIU
+x = 6 (an arbitrary choice for illustration purpose). We note that it agrees quite well
+with the true distribution at G∆(6).
+0 2 4 6 8 10 12 14
+x
+0
+5
+10
+15
+20
+25
+30a(x)
+Reference
+Learned
+0 2 4 6 8 10 12 14
+x
+0
+2
+4
+6
+8
+10
+12
+14b(x)
+Reference
+Learned
+Fig. 11. Geometric Brownian motion. Left: recovery of the drift a(x) =µx; Right: recovery of
+the diﬀusion b(x) =σx.
+3 4 5 6 7
+x
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8pdf
+Reference
+Learned
+Fig. 12. Geometric Brownian motion: comparison of the conditional distribution G∆(6) and
+˜G∆(6).
+5.2. Nonlinear SDE. Similar to the work of [10], we present two Itˆ o type SDEs
+with non-linear drift and diﬀusion functions.
+5.2.1. SDE with nonlinear diﬀusion. We ﬁrst consider a SDE with a non-
+linear diﬀusion,
+(5.3) dxt = −µxtdt +σe−x2
+tdWt,
+where µ and σ are constants. In this example, we set µ = 5 and σ = 0.5. The
+SDE is solved with initial conditions from a uniform distribution U(−1, 1), for up to
+time T = 1.0. Some of the solution samples are shown on the left of Figure 13. The
+
+
+===== PAGE 17 =====
+FLOW MAP LEARNING OF SDE 17
+simulated solutions of the learned sFML model are shown on the right of Figure 13,
+with an initial condition x0 = −0.4 and for time up to T = 10, for visual comparison.
+The evolutions of mean and STD of the sFML model are shown in Figure 14, where
+good agreement with those of the true solution can be observed.
+0 2 4 6 8 10
+T
+0.8
+0.6
+0.4
+0.2
+0.0
+0.2
+0 2 4 6 8 10
+T
+0.4
+0.2
+0.0
+0.2
+0.4
+Fig. 13. SDE with nonlinear diﬀusion (5.3). Left: samples of the training data; Right: samples
+of the learned sFML model simulations for up to T = 10.0 with an initial condition x0 =−0.4.
+0 2 4 6 8 10
+T
+0.4
+0.3
+0.2
+0.1
+0.0
+0.1
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+Fig. 14. Mean and standard deviation of the learned sFML model for (5.3).
+The recovered eﬀective drift and diﬀusion functions are plotted in Figure 15,
+whereas the conditional distribution of ˜G∆(−0.3) is plotted in Figure 16. Again,
+good agreement can be observed when compared to the reference solutions.
+5.2.2. Trigonometric drift and diﬀusion. We now consider the following
+non-linear SDE:
+(5.4) dxt = sin(2kπxt)dt +σ cos(2kπxt)dWt,
+
+
+===== PAGE 18 =====
+18 YUAN CHEN AND DONGBIN XIU
+0.6
+ 0.4
+ 0.2
+ 0.0 0.2 0.4 0.6
+x
+3
+2
+1
+0
+1
+2
+3
+a(x)
+Reference
+Learned
+0.6
+ 0.4
+ 0.2
+ 0.0 0.2 0.4 0.6
+x
+0.34
+0.36
+0.38
+0.40
+0.42
+0.44
+0.46
+0.48
+0.50b(x)
+Reference
+Learned
+Fig. 15. Nonlinear SDE (5.3). Left: recovery of the drift a(x) =−µx; Right: recovery of the
+diﬀusion b(x) =σe−x2
+.
+0.50
+ 0.45
+ 0.40
+ 0.35
+ 0.30
+ 0.25
+ 0.20
+ 0.15
+ 0.10
+x
+0
+2
+4
+6
+8pdf
+Reference
+Learned
+Fig. 16. Nonlinear SDE (5.3). Comparison of the conditional distribution for G∆(−0.3) and
+˜G∆(−0.3).
+where the constant k and σ are set at k = 1 and σ = 0.5. The training data are
+generated with initial conditions uniformly distributed as U(0.35, 0.7) for up to time
+T = 1.0 as the training data). See the left of Figure 17 for an example trajectory.
+Upon training the sFML model from the training data, we simulate the learned process
+for a longer time up to T = 10. A sample of the simulated trajectory is shown on
+the right of Figure 17, under the initial condition x0 = 0.6. The mean and standard
+deviation of the solutions are estimated using 100 , 000 sFML model simulations and
+plotted Figure 18. They agree very well with those of the true solutions.
+We then compute the eﬀective drift and diﬀusion functions (4.23) from the learned
+sFML model and compare them to the true drift and diﬀusion functions. The com-
+parison is shown in Figure 19, where good agreement can be seen. The accuracy
+starts to deterioriate near the end points, as there are increasingly small number of
+samples towards the end points. Accuracy loss is thus expected. The conditional
+
+
+===== PAGE 19 =====
+FLOW MAP LEARNING OF SDE 19
+0 2 4 6 8 10
+T
+0.35
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+0 2 4 6 8 10
+T
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Fig. 17. Nonlinear SDE (5.4). Left: a sample trajectory used in the training data; Right: a
+sample trajectory of the simulated solution by the learned sFML model for time up to T = 10.0 with
+an initial condition x0 = 0.6.
+0 2 4 6 8 10
+T
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+Fig. 18. Mean and standard deviation of the learned sFML model for (5.4).
+distribution by the learned sFML stochastic ﬂow map ˜G∆(x) is plotted for x = 0.5
+(an arbitrary choice for illustration purpose). It agrees well with the distribution of
+the true stochastic ﬂow map G∆(0.5).
+5.2.3. SDE with double well potential. We consider a one-dimensional SDE
+with a double well potential:
+(5.5) dxt = (xt −x3
+t )dt +σdWt,
+where the constant σ is set as σ = 0.5. The stochastic driving term is suﬃciently
+large to induce random solution transitions between the two stable states of x = 1
+and x = −1.
+The training data are generated by solving the true SDE with initial conditions
+uniformly sampled in U(−2.5, 2.5) for up to T = 1.0. A few such sample trajectories
+
+
+===== PAGE 20 =====
+20 YUAN CHEN AND DONGBIN XIU
+0.30 0.35 0.40 0.45 0.50 0.55 0.60 0.65 0.70
+x
+1.00
+0.75
+0.50
+0.25
+0.00
+0.25
+0.50
+0.75
+1.00
+a(x)
+Reference
+Learned
+0.30 0.35 0.40 0.45 0.50 0.55 0.60 0.65 0.70
+x
+0.15
+0.20
+0.25
+0.30
+0.35
+0.40
+0.45
+0.50b(x)
+Reference
+Learned
+Fig. 19. Nonlinear SDE (5.4). Left: recovery of the drift a(x) = sin(2kπx); Right: recovery of
+the diﬀusion b(x) =σ cos(2kπx).
+0.30 0.35 0.40 0.45 0.50 0.55 0.60 0.65 0.70
+x
+0
+1
+2
+3
+4
+5
+6
+7
+8pdf
+Reference
+Learned
+Fig. 20 . Nonlinear SDE (5.4): comparison of the conditional distribution of G∆(0.5) and
+˜G∆(0.5).
+are shown on the left of Figure 21. We emphasize that the trajectories in the training
+data set are so short that they do not contain transitions between the two stable
+states. Using these short bursts of training data, we train the sFML model and
+conduct long-term predictions. The results of two solution trajectories with an initial
+condition x0 = 1.5 for time up to T = 300 are shown on the right of Figure 21. We
+clearly observe the solution transition between the two stable states. The transitions
+occur with a small probability and over a time frame on the order of O(10). Thus,
+the transitions are not observed in the training data, which span only T = 0.4. This
+result demonstrates the learning capability of sFML – the learned model is able to
+produce the correct solution behaviors even though they may not be present in the
+training data.
+We then recover the drift and diﬀusion functions by computing the eﬀective drift
+and diﬀusion functions (4.23). The results are shown in Figure 22, where good agree-
+
+
+===== PAGE 21 =====
+FLOW MAP LEARNING OF SDE 21
+0.0 0.2 0.4 0.6 0.8 1.0
+T
+2.0
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+2.0
+0 50 100 150 200 250 300
+T
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+Fig. 21. SDE with double well potential (5.5). Left: samples of the training date trajectories
+for T = 1.0 (Note that there are no solution transitions.); Right: solution trajectories by the learned
+sFML model for time T = 300.0, with an initial condition x0 = 1.5. Note the state transitions occur
+over time.
+2.0
+ 1.5
+ 1.0
+ 0.5
+ 0.0 0.5 1.0 1.5 2.0
+x
+6
+4
+2
+0
+2
+4
+6
+a(x)
+Reference
+Learned
+2.0
+ 1.5
+ 1.0
+ 0.5
+ 0.0 0.5 1.0 1.5 2.0
+x
+0.46
+0.48
+0.50
+0.52
+0.54b(x)
+Reference
+Learned
+Fig. 22. SDE with double well potential (5.5). Left: recovery of the drift a(x) =x−x3; Right:
+recovery of diﬀusion b(x) = 0.5.
+ment in the drift function is observed. Although the error in the constant diﬀu-
+sion function is visible, it is rather acceptable at about 2%. The evolution of the
+probability distribution of the solution is shown in Figure 23, at various time lev-
+els T = 0.5, 10.0, 30.0, 100.0. It is started from an initial condition x0 = 1.5 and
+computed by using 100 , 000 simulated trajectories by the sFML model. Excellent
+agreement with the reference solution from the true SDE is evident.
+4
+ 2
+ 0 2 4
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00 Reference
+Learned
+4
+ 2
+ 0 2 4
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Reference
+Learned
+4
+ 2
+ 0 2 4
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8 Reference
+Learned
+4
+ 2
+ 0 2 4
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Reference
+Learned
+Fig. 23 . SDE with double well potential (5.5). The predicted solution pdf’s with an initial
+condition x0 = 1.5 against those of the reference true solution at time T = 0.5, 10, 30 and 100
+(from left to right).
+5.3. SDEs with Non-Gaussian Noises. The applicability of the proposed
+sFML approach is not restricted to modeling the classical SDE with Gaussian noises
+from Wiener process. To demonstrate this, we consider SDEs with non-Gaussian
+noises.
+
+
+===== PAGE 22 =====
+22 YUAN CHEN AND DONGBIN XIU
+5.3.1. Noises with Exponential Distribution. Let us consider a SDE with
+exponentially distributed noise inputs,
+(5.6) dxt =µxtdt +σ
+√
+dtηt, η t ∼ Exp(1),
+where ηt has an exponential pdf fη(x) = e−x, x ≥ 0, and the constants are set as
+µ = −2.0 and σ = 0.1.
+We plot a few samples of the training data in the left of Figure 24 up to T = 1.0.
+Some of the simulated trajectory samples by the learned sFML model are shown are
+on the right of Figure 24 for up to T = 5.0. The mean and standard deviation of
+the sFML prediction are shown on the left of Figure 25, where good agreement with
+those of the truth can be observed. On the right of Figure 25, we show the conditional
+distribution by the sFML model generator ˜G∆(x) at x = 0.34 (an arbitrary choice
+for demonstration). It agrees with the reference solution G∆(0.34) generally well,
+with visible discrepancy at the left end of the domain. The reference distribution is
+exponential and has a clear cut-oﬀ, whereas the sFML solution exhibits a small tail.
+This is not surprising because the sFML generative model is built upon stochastic
+input z with the standard Gaussian distribution. Presumably the small discrepancy
+in the left tail can be eliminated if one uses exceedingly high order accuracy in the
+approximation. This is diﬃcult to achieve with DNN training and we did not pursue
+it further.
+0 1 2 3 4 5
+T
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+0 1 2 3 4 5
+T
+0.35
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+Fig. 24. SDE with exponential noise. Left: samples of the training data trajectories; Right:
+Samples of the sFML model simulations with an initial condition x0 = 0.4 for up to T = 5.0.
+0 1 2 3 4 5
+T
+0.400
+0.425
+0.450
+0.475
+0.500
+0.525
+0.550
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+0.32 0.34 0.36 0.38 0.40 0.42
+x
+0
+20
+40
+60
+80
+100pdf
+Reference
+Learned
+Fig. 25. SDE with exponential noise. Left: mean and standard deviation of the sFML model
+predictions; Right: conditional distribution by the sFML model ˜G∆(x) against that of the true model
+G∆(x) at x = 0.34.
+Upon moving the non-zero mean of the exponential distribution out of the noise
+
+
+===== PAGE 23 =====
+FLOW MAP LEARNING OF SDE 23
+term, we can write the SDE in the form of the classical SDE (2.6) and obtain the drift
+and diﬀusion as
+a(xn) = Eω
+(xn+1 −xn
+∆
+⏐⏐⏐xn
+)
+=µxn + σ√
+∆
+,
+b(xn) = Stdω
+(xn+1 −xn
+∆ |xn
+)
+=σ.
+(5.7)
+The eﬀective drift and diﬀusion recovered by the sFML model are shown in Figure
+26, where we observe very good agreement with the reference truth.
+0.3 0.4 0.5 0.6 0.7 0.8 0.9
+x
+0.8
+0.6
+0.4
+0.2
+0.0
+0.2
+0.4
+a(x)
+Reference
+Learned
+0.3 0.4 0.5 0.6 0.7 0.8 0.9
+x
+0.0900
+0.0925
+0.0950
+0.0975
+0.1000
+0.1025
+0.1050
+0.1075
+0.1100b(x)
+Reference
+Learned
+Fig. 26. SDE with exponential noise. Left: Recovery of the drift a(x) = µx +σ/
+√
+∆; Right:
+recovery of the diﬀusion b(x) =σ.
+5.3.2. Noise with Lognormal Distribution. We now consider the following
+stochastic system
+(5.8) d logxt = (logm −θ logxt)dt +σdWt,
+where m, θ and σ are parameters. This is eﬀectively an OU process after taking an
+exponential operation. Its dynamics can be solved by using Euler method with the
+following scheme:
+(5.9) xn+1 =m∆x1−θ∆
+n ησ
+√
+∆
+n , η n ∼ Lognormal(0, 1).
+In our test, we take m = 1/√e,θ = 1.0 and σ = 0.3. It is obvious that the condi-
+tional distribution from the stochastic ﬂow map G∆(x) follows lognormal distribution
+for any x. The training data are generated with initial condition uniformly sampled
+from U(0.1, 2.0) up to time T = 1.0. See the left of Figure 27 for some samples. Upon
+training the sFML model, we conduct system prediction for time up toT = 5.0. Some
+simulation samples with an initial conditionx0 = 1.5 are shown on the right of Figure
+27. The mean and standard deviation from the sFML model prediction, as well as the
+distribution of ˜G∆, are shown in Figure 27. Good agreement with the truth reference
+solutions can be observed.
+Like in the previous example, we rewrite this SDE in the form of the classical
+SDE (2.6) and obtain
+a(xn) = ln
+[ (
+Eω
+(xn+1
+xn
+⏐⏐⏐xn
+))1/∆]
+= ln(mx−θ
+n ) +σ2
+2 ,
+b(xn) = Stdω (xn+1|xn) =
+√
+eσ2∆ − 1(meσ2/2)∆(1 −θ∆)xn.
+(5.10)
+
+
+===== PAGE 24 =====
+24 YUAN CHEN AND DONGBIN XIU
+0 1 2 3 4 5
+T
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+0 1 2 3 4 5
+T
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+Fig. 27. SDE with lognormal distribution. Left: Samples of the training trajectory data; Right:
+Simulation sample of the trained sFML model with an initial condition x0 = 1.5.
+0 1 2 3 4 5
+T
+0.6
+0.8
+1.0
+1.2
+1.4
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+0.36 0.38 0.40 0.42 0.44
+x
+0
+5
+10
+15
+20
+25
+30
+35pdf
+Reference
+Learned
+Fig. 28. SDE with lognormal distribution. Left: mean and standard deviation of the sFML
+model prediction with the initial condition x0 = 1.5; Right: conditional probability by the sFML
+generator ˜G∆(x) at x = 0.4.
+From the learned sFML model, we estimate the eﬀective drift and diﬀusion via
+(5.11) ˆ a(x) = ln
+
+
+(
+Eω
+( ˜G∆(x,ω )
+x
+))1/∆
+, ˆb(x) = Stdω( ˜G∆(x,ω )).
+The comparison of functions for a(x) and b(x) are shown in Figure 29, where we
+observe good agreement between the recovered functions by the learned sFML model
+and the reference (5.10).
+0.2 0.4 0.6 0.8 1.0 1.2 1.4 1.6
+x
+1.0
+0.5
+0.0
+0.5
+1.0
+a(x)
+Reference
+Learned
+0.2 0.4 0.6 0.8 1.0 1.2 1.4 1.6
+x
+0.01
+0.02
+0.03
+0.04
+0.05b(x)
+Reference
+Learned
+Fig. 29. SDE with lognormal distribution. Left: recovery of the drift a(x); Right: recovery of
+conditional standard deviation b(x); (See (5.10) for the reference solution.)
+
+
+===== PAGE 25 =====
+FLOW MAP LEARNING OF SDE 25
+5.4. Two-Dimensional SDEs. In this section, we present examples of learning
+two-dimensional SDE systems.
+5.4.1. Two-dimensional Ornstein–Uhlenbeck process. We ﬁrst consider a
+2-dimensional OU process,
+(5.12) dxt = Bxtdt + ΣdWt,
+where xt = (x1,x 2) ∈ R2 are the state variables, B and Σ are (2 × 2) are matrices.
+In our test, we set
+B =
+( −1 −0.5
+−1 −1
+)
+Σ =
+( 1 0
+0 0 .5
+)
+.
+Our training data are generated with random initial conditions uniformly sampled
+from U([−4, 4] × [−3, 3]), for a termination time up to T = 1.0. In the top row of
+Figure 30, a few sample training data trajectories are shown. Upon training the sFML
+model, we conduct system predictions for time up to T = 5. In the bottom row of
+Figure 30, we show a few prediction trajectories by the trained sFML model, with
+an initial condition of x0 = (0.3, 0.4). The mean and the standard deviation of the
+model prediction are shown Figure 31, where we observe very good agreement with
+the reference solutions. To examine the conditional probability distribution generated
+by the learned sFML model, we present both the joint probability distribution and
+its marginal distributions by the sFML generator ˜G∆(x) at x = (0, 0), along with
+the true distribution G∆ for comparison. The results are in Figure 32, where good
+agreement with the true conditional distribution can be seen.
+0 1 2 3 4 5
+T
+2
+1
+0
+1
+2
+3
+0 1 2 3 4 5
+T
+3
+2
+1
+0
+1
+2
+0 1 2 3 4 5
+T
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+0 1 2 3 4 5
+T
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+Fig. 30. Learning the 2d OU process (5.12). Top row: samples of the training data for x1 (left)
+and x2 (right); Bottom row: The sFML model prediction trajectories for x1 (left) and x2 (right),
+with an initial condition x0 = (0.3, 0.4).
+
+
+===== PAGE 26 =====
+26 YUAN CHEN AND DONGBIN XIU
+0 1 2 3 4 5
+T
+1.0
+0.5
+0.0
+0.5
+1.0
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+0 1 2 3 4 5
+T
+1.00
+0.75
+0.50
+0.25
+0.00
+0.25
+0.50
+0.75
+1.00
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+Fig. 31. Solution mean and standard deviation of the sFML model prediction for the 2d OU
+process (5.12). Left: x1; Right: x2.
+0.3
+ 0.2
+ 0.1
+ 0.0 0.1 0.2 0.3
+0.3
+0.2
+0.1
+0.0
+0.1
+0.2
+0.3 Learned
+0.3
+ 0.2
+ 0.1
+ 0.0 0.1 0.2 0.3
+0.3
+0.2
+0.1
+0.0
+0.1
+0.2
+0.3 Reference
+Fig. 32 . Learning the 2d OU process (5.12).: conditional probability distribution from the
+learned sFML generator ˜G∆(x) (left) and from the true generator G∆(x) (right) at x = (0, 0).
+5.4.2. Stochastic Oscillator. In this example, we consider the following sto-
+chastic oscillator,
+(5.13)
+{ ˙x1 =x2,
+˙x2 = −x1 +σ ˙Wt.
+Here σ is the perturbation parameter and set as σ = 0.1 in our test. Our training
+data are generated with initial conditions uniformly sampled from U([−1.5, 1.5] ×
+[−1.5, 1.5]), for time up to T = 1.0. Some of the training data trajectories are shown
+on the left of Figure 33, for visualization purpose. For the sFML model training, we
+use 100 recurrent steps for 5,000 epochs for the deterministic sub-map ˜D∆. For the
+stochastic sub-map, we use GANs the 4-layer, each of which with 80 nodes. Once
+trained, we conduct system prediction using the learned sFML model for time up to
+T = 6.5. Some sample trajectories are shown on the right of Figure 33, for an initial
+condition of x0 = (0.3, 0.4).
+The mean and standard deviation of the system prediction by the learned sFML
+model are shown in Figure 34, along with those of the true solution. Good accuracy of
+the model prediction is observed. In Figure 35, we present the marginal distributions
+of the conditional probability distribution produced by the learned stochastic ﬂow
+map ˜G∆(x) at x = ( −0.5, −0.5), in comparison with those of the true conditional
+
+
+===== PAGE 27 =====
+FLOW MAP LEARNING OF SDE 27
+1.5
+ 1.0
+ 0.5
+ 0.0 0.5 1.0 1.5 2.0
+x1
+1.5
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+2.0
+x2
+0.6
+ 0.4
+ 0.2
+ 0.0 0.2 0.4 0.6
+x1
+0.6
+0.4
+0.2
+0.0
+0.2
+0.4
+0.6
+0.8
+x2
+Fig. 33. Stochastic oscillator (5.13). Left: samples of the phase portrait of the training trajec-
+tory data (up to T = 1.0); Right: phase portait of samples of the sFML prediction solution for up
+to T = 6.5, with the initial condition x0 = (0.3, 0.4).
+distribution from G∆. In this particularly case, the marginal distribution in x1 is a
+Dirac measure, as the equation of x1 is deterministic. We observe that the learned
+sFML model produces very accurate prediction for such an extreme case.
+0 1 2 3 4 5 6
+T
+0.8
+0.6
+0.4
+0.2
+0.0
+0.2
+0.4
+0.6
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+0 1 2 3 4 5 6
+T
+0.6
+0.4
+0.2
+0.0
+0.2
+0.4
+0.6
+0.8
+Ground Truth Mean
+Prediction Mean
+Ground Truth Std
+Prediction Std
+Fig. 34. Mean and standard deviation of the stochastic oscillator (5.13). Left: x1; Right: x2.
+0.54
+ 0.52
+ 0.50
+ 0.48
+ 0.46
+x
+0
+100
+200
+300
+400
+500pdf
+Reference
+Learned
+0.56
+ 0.54
+ 0.52
+ 0.50
+ 0.48
+ 0.46
+ 0.44
+x
+0
+5
+10
+15
+20
+25
+30
+35
+40pdf
+Reference
+Learned
+Fig. 35. Stochastic oscillator (5.13): marginal distributions for x1 (left) and x2 (right) gener-
+ated by the learned model ˜G∆(x) and the true model G∆(x) at x = (−0.5,−0.5).
+6. Conclusions. In this paper, we proposed a general numerical framework for
+modeling unknown stochastic system by using observed trajectory data. Our method
+is based on constructing an approximation of the underlying ﬂow map of the unknown
+stochastic system. The constructed ﬂow map consists of two parts: a deterministic
+
+
+===== PAGE 28 =====
+28 YUAN CHEN AND DONGBIN XIU
+sub-map and a stochastic sub-map, both of which are learned by using the same
+observation data set. While a standard feedforward DNN is used to learn the deter-
+ministic sub-map, which predicts the conditional mean of the underlying dynamics,
+a generative DNN is used to learn the stochastic sub-map, which captures the noisy
+dynamics. In this paper, we employ GANs as the stochastic sub-map generator. By
+using a comprehensive set of numerical examples, we demonstrated that the proposed
+approach is highly eﬀective and accurate to model a variety of stochastic systems.
+The learned generative model is able to conduct long-term system predictions beyond
+the time domain of the training data. More research is needed to further examine
+and understand the proposed method. For example, other generative models such as
+normalizing ﬂow can be used for the construction of the stochastic sub-map. These
+issues will be studied and reported in future work.
+REFERENCES
+[1] C. Archambeau, D. Cornford, M. Opper, and J. Shawe-Taylor , Gaussian process
+approximations of stochastic diﬀerential equations, in Gaussian Processes in Practice,
+N. D. Lawrence, A. Schwaighofer, and J. Qui˜ nonero Candela, eds., vol. 1 of Proceedings
+of Machine Learning Research, Bletchley Park, UK, 12–13 Jun 2007, PMLR, pp. 1–16,
+https://proceedings.mlr.press/v1/archambeau07a.html.
+[2] M. Arjovsky, S. Chintala, and L. Bottou , Wasserstein generative adversarial networks,
+in Proceedings of the 34th International Conference on Machine Learning, D. Precup and
+Y. W. Teh, eds., vol. 70 of Proceedings of Machine Learning Research, PMLR, 06–11 Aug
+2017, pp. 214–223, https://proceedings.mlr.press/v70/arjovsky17a.html.
+[3] D. Berthelot, T. Schumm, and L. Metz , Began: Boundary equilibrium generative
+adversarial networks, arXiv preprint arXiv:1703.10717, (2017).
+[4] L. Boninsegna, F. N ¨uske, and C. Clementi , Sparse learning of stochastic dynamical
+equations, The Journal of Chemical Physics, 148 (2018), p. 241723.
+[5] S. L. Brunton, J. L. Proctor, and J. N. Kutz, Discovering governing equations from data by
+sparse identiﬁcation of nonlinear dynamical systems, Proceedings of the national academy
+of sciences, 113 (2016), pp. 3932–3937.
+[6] X. Chen, J. Duan, J. Hu, and D. Li, Data-driven method to learn the most probable transition
+pathway and stochastic diﬀerential equation, Physica D: Nonlinear Phenomena, 443 (2023),
+p. 133559.
+[7] X. Chen, L. Yang, J. Duan, and G. E. Karniadakis , Solving inverse stochastic problems
+from discrete particle observations using the fokker–planck equation and physics-informed
+neural networks, SIAM Journal on Scientiﬁc Computing, 43 (2021), pp. B811–B830.
+[8] Z. Chen, V. Churchill, K. Wu, and D. Xiu , Deep neural network modeling of unknown
+partial diﬀerential equations in nodal space, Journal of Computational Physics, 449 (2022),
+p. 110782.
+[9] G. Chevillon and D. Hendry , Non-parametric direct multi-step estimation for forecasting
+economic progresses, International Journal of Forecasting, 21 (2005), pp. 201–218.
+[10] M. Darcy, B. Hamzi, G. Livieri, H. Owhadi, and P. Tavallali , One-shot learning of
+stochastic diﬀerential equations with data adapted kernels, Physica D: Nonlinear Phe-
+nomena, 444 (2023), p. 133583.
+[11] F. Dietrich, A. Makeev, G. Kevrekidis, N. Evangelou, T. Bertalan, S. Reich, and
+I. G. Kevrekidis , Learning eﬀective stochastic diﬀerential equations from microscopic
+simulations: Linking stochastic numerics to deep learning, Chaos: An Interdisciplinary
+Journal of Nonlinear Science, 33 (2023), p. 023121.
+[12] N. Dridi, L. Drumetz, and R. Fablet , Learning stochastic dynamical systems with neural
+networks mimicking the euler-maruyama scheme, in 2021 29th European Signal Processing
+Conference (EUSIPCO), IEEE, 2021, pp. 1990–1994.
+[13] P. Franses and R. Legerstee , A unifying view on multi-step forecasting using an
+autoregression, Journal of Economic Surveys, 24 (2009), pp. 389–401.
+[14] R. Friedrich, J. Peinke, M. Sahimi, and M. R. R. Tabar , Approaching complexity by
+stochastic methods: From biological systems to turbulence, Physics Reports, 506 (2011),
+pp. 87–162.
+[15] X. Fu, L.-B. Chang, and D. Xiu , Learning reduced systems via deep neural networks with
+
+
+===== PAGE 29 =====
+FLOW MAP LEARNING OF SDE 29
+memory, Journal of Machine Learning for Modeling and Computing, 1 (2020), pp. 97–118.
+[16] I. Goodfellow, J. Pouget-Abadie, M. Mirza, B. Xu, D. Warde-Farley, S. Ozair,
+A. Courville, and Y. Bengio , Generative adversarial nets, in Advances in Neural In-
+formation Processing Systems, Z. Ghahramani, M. Welling, C. Cortes, N. Lawrence, and
+K. Weinberger, eds., vol. 27, Curran Associates, Inc., 2014, https://proceedings.neurips.
+cc/paper ﬁles/paper/2014/ﬁle/5ca3e9b122f61f8f06494c97b1afccf3-Paper.pdf.
+[17] I. Goodfellow, J. Pouget-Abadie, M. Mirza, B. Xu, D. Warde-Farley, S. Ozair,
+A. Courville, and Y. Bengio , Generative adversarial networks, Communications of the
+ACM, 63 (2020), pp. 139–144.
+[18] Y. Gu, J. Harlim, S. Liang, and H. Yang , Stationary density estimation of itˆ odiﬀusions
+using deep learning, SIAM Journal on Numerical Analysis, 61 (2023), pp. 45–82, https:
+//doi.org/10.1137/21M1445363, https://doi.org/10.1137/21M1445363, https://arxiv.org/
+abs/https://doi.org/10.1137/21M1445363.
+[19] I. Gulrajani, F. Ahmed, M. Arjovsky, V. Dumoulin, and A. C. Courville , Improved
+training of wasserstein gans, Advances in neural information processing systems, 30 (2017).
+[20] S. Infante, C. Luna, L. S ´anchez, and A. Hern ´andez, Approximations of the solutions of
+a stochastic diﬀerential equation using dirichlet process mixtures and gaussian mixtures,
+Statistics, Optimization & Information Computing, 4 (2016), pp. 289–307.
+[21] S. H. Kang, W. Liao, and Y. Liu , Ident: Identifying diﬀerential equations with numerical
+time evolution, Journal of Scientiﬁc Computing, 87 (2021), pp. 1–27.
+[22] S. Kazeminia, C. Baur, A. Kuijper, B. van Ginneken, N. Navab, S. Albarqouni, and
+A. Mukhopadhyay, Gans for medical image analysis, Artiﬁcial Intelligence in Medicine,
+109 (2020), p. 101938.
+[23] Y. Li and J. Duan, A data-driven approach for discovering stochastic dynamical systems with
+non-gaussian l´ evynoise, Physica D: Nonlinear Phenomena, 417 (2021), p. 132830.
+[24] Z. Li, N. Kovachki, K. Azizzadenesheli, B. Liu, K. Bhattacharya, A. Stuart, and
+A. Anandkumar , Fourier neural operator for parametric partial diﬀerential equations,
+in International Conference on Learning Representations, 2021, https://openreview.net/
+forum?id=c8P9NQVtmnO.
+[25] J. Liu, Z. Long, R. Wang, J. Sun, and B. Dong , Rode-net: learning ordinary diﬀerential
+equations with randomness from data, arXiv preprint arXiv:2006.02377, (2020).
+[26] B. Øksendal, Stochastic diﬀerential equations, in Stochastic diﬀerential equations, Springer,
+2003, pp. 65–84.
+[27] M. Opper, Variational inference for stochastic diﬀerential equations, Annalen der Physik, 531
+(2019), p. 1800233.
+[28] H. Owhadi, Computational graph completion, Research in the Mathematical Sciences, 9 (2022),
+p. 27.
+[29] T. Qin, Z. Chen, J. D. Jakeman, and D. Xiu , Data-driven learning of nonautonomous
+systems, SIAM Journal on Scientiﬁc Computing, 43 (2021), pp. A1607–A1624.
+[30] T. Qin, K. Wu, and D. Xiu, Data driven governing equations approximation using deep neural
+networks, Journal of Computational Physics, 395 (2019), pp. 620–635.
+[31] M. Raissi, P. Perdikaris, and G. E. Karniadakis, Multistep neural networks for data-driven
+discovery of nonlinear dynamical systems, arXiv preprint arXiv:1801.01236, (2018).
+[32] M. Raissi, P. Perdikaris, and G. E. Karniadakis, Physics-informed neural networks: A deep
+learning framework for solving forward and inverse problems involving nonlinear partial
+diﬀerential equations, Journal of Computational physics, 378 (2019), pp. 686–707.
+[33] S. Reed, Z. Akata, X. Yan, L. Logeswaran, B. Schiele, and H. Lee, Generative adversarial
+text to image synthesis, in International conference on machine learning, PMLR, 2016,
+pp. 1060–1069.
+[34] H. Schaeffer and S. G. McCalla, Sparse model selection via integral terms, Physical Review
+E, 96 (2017), p. 023302.
+[35] H. Schaeffer, G. Tran, and R. Ward , Extracting sparse high-dimensional dynamics from
+limited data, SIAM Journal on Applied Mathematics, 78 (2018), pp. 3279–3295.
+[36] T.-C. Wang, M.-Y. Liu, J.-Y. Zhu, A. Tao, J. Kautz, and B. Catanzaro , High-resolution
+image synthesis and semantic manipulation with conditional gans, in Proceedings of the
+IEEE conference on computer vision and pattern recognition, 2018, pp. 8798–8807.
+[37] Y. Wang, H. Fang, J. Jin, G. Ma, X. He, X. Dai, Z. Yue, C. Cheng, H.-T. Zhang, D. Pu,
+et al., Data-driven discovery of stochastic diﬀerential equations, Engineering, (2022).
+[38] A. Weiss and A. Andersen , Estimating time series models using the relevant forecast
+evaluation criterion, Journal of the Royal Statistical Society Series A: Statistics in Society,
+147 (1984), p. 484.
+[39] K. Wu and D. Xiu , Numerical aspects for approximating governing equations using data,
+
+
+===== PAGE 30 =====
+30 YUAN CHEN AND DONGBIN XIU
+Journal of Computational Physics, 384 (2019), pp. 200–221.
+[40] K. Wu and D. Xiu, Data-driven deep learning of partial diﬀerential equations in modal space,
+Journal of Computational Physics, 408 (2020), p. 109307.
+[41] K. Xu and E. Darve, Solving inverse problems in stochastic models using deep neural networks
+and adversarial training, Computer Methods in Applied Mechanics and Engineering, 384
+(2021), p. 113976.
+[42] L. Yang, C. Daskalakis, and G. E. Karniadakis , Generative ensemble regression: Learning
+particle dynamics from observations of ensembles with physics-informed deep generative
+models, SIAM Journal on Scientiﬁc Computing, 44 (2022), pp. B80–B99.
+[43] L. Yang, D. Zhang, and G. E. Karniadakis, Physics-informed generative adversarial networks
+for stochastic diﬀerential equations, SIAM Journal on Scientiﬁc Computing, 42 (2020),
+pp. A292–A317.
+[44] Y. Yang and P. Perdikaris, Adversarial uncertainty quantiﬁcation in physics-informed neural
+networks, Journal of Computational Physics, 394 (2019), pp. 136–152.
+[45] C. Yildiz, M. Heinonen, J. Intosalmi, H. Mannerstrom, and H. Lahdesmaki , Learning
+stochastic diﬀerential equations with gaussian processes without gradient matching, in 2018
+IEEE 28th International Workshop on Machine Learning for Signal Processing (MLSP),
+IEEE, 2018, pp. 1–6.
+[46] H. Zhang, T. Xu, H. Li, S. Zhang, X. Wang, X. Huang, and D. N. Metaxas , Stackgan:
+Text to photo-realistic image synthesis with stacked generative adversarial networks, in
+Proceedings of the IEEE international conference on computer vision, 2017, pp. 5907–5915.
+[47] Y. Zhu, Y.-H. Tang, and C. Kim, Learning stochastic dynamics with statistics-informed neural
+network, Journal of Computational Physics, 474 (2023), p. 111819.
