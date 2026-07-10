@@ -1,12 +1,12 @@
 seed: 0
-eval_only: false   # set true to skip training and load saved models for eval only
+eval_only: true   # set true to skip training and load saved models for eval only
 
 dtype: single
 
 # Double-well SDE (Chen & Xiu 2024, §5.2.3):
 #   dx = (x - x^3) dt + sigma dW,   sigma=0.5,  dt=0.01
-# IC: U(-2, 2).  Test: x0=0 (saddle), T=5.
-# Paper uses IC U(-2.5,2.5), test x0=1.5 (stable well), T=300.
+# IC: U(-2, 2).  Test: x0=1.5 (right well), T=20 (paper uses T=300).
+# Paper IC: U(-2.5, 2.5).
 
 data:
     problem_dim: 1
