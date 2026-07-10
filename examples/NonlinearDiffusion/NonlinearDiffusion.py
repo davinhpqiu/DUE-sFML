@@ -35,18 +35,23 @@ conf_net["sequence_length"] = trainY.shape[-1]
 NZ = data_loader.normalizer
 print(f"Normalization: {data_loader.normalization} (lambda={float(NZ.lam[0]):.3f})")
 
-# ---- Phase 1 ----
-_arch = conf_net.get("det_arch", "resnet")
-print(f"Phase-1 architecture: {_arch}")
-det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
-phase1 = due.models.ODE(trainX, trainY, det_net, conf_train)
-phase1.train(); phase1.save_hist()
-det_net = torch.load(conf_train["save_path"] + "/model", map_location=conf_train["device"], weights_only=False)
+# ---- eval_only mode ----
+EVAL_ONLY = bool(config_raw.get("eval_only", False))
+if EVAL_ONLY:
+    print(">>> eval_only=true: skipping Phase 1 and Phase 2 training, loading saved models.")
+else:
+    # ---- Phase 1 ----
+    _arch = conf_net.get("det_arch", "resnet")
+    print(f"Phase-1 architecture: {_arch}")
+    det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
+    phase1 = due.models.ODE(trainX, trainY, det_net, conf_train)
+    phase1.train(); phase1.save_hist()
+    det_net = torch.load(conf_train["save_path"] + "/model", map_location=conf_train["device"], weights_only=False)
 
-# ---- Phase 2 ----
-generator = due.networks.gan.Generator(conf_net); critic = due.networks.gan.Critic(conf_net)
-sde_model = due.models.SDE(trainX, trainY, det_net, generator, critic, conf_gan)
-sde_model.train(); sde_model.save_hist()
+    # ---- Phase 2 ----
+    generator = due.networks.gan.Generator(conf_net); critic = due.networks.gan.Critic(conf_net)
+    sde_model = due.models.SDE(trainX, trainY, det_net, generator, critic, conf_gan)
+    sde_model.train(); sde_model.save_hist()
 
 # ---- evaluation ----
 device = conf_train["device"]

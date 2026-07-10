@@ -1,12 +1,12 @@
 seed: 0
-eval_only: true   # set true to skip training and load saved models for eval only
+eval_only: false   # set true to skip training and load saved models for eval only
 
 dtype: single
 
-# Nonlinear diffusion (Chen & Xiu 2024, §5.2.1):
-#   dx = -mu*x dt + sigma*e^{-x^2} dW,   mu=5, sigma=0.5,  dt=0.01
-# IC: U(-1, 1).  Test: x0=-0.4, T=4.
-# Open issue: bell-shaped diffusion not recovered — see sfml_status.md
+# Double-well SDE (Chen & Xiu 2024, §5.2.3):
+#   dx = (x - x^3) dt + sigma dW,   sigma=0.5,  dt=0.01
+# IC: U(-2, 2).  Test: x0=0 (saddle), T=5.
+# Paper uses IC U(-2.5,2.5), test x0=1.5 (stable well), T=300.
 
 data:
     problem_dim: 1
@@ -28,7 +28,7 @@ network:
 training:
     device: "cpu"
     valid: 0
-    epochs: 250
+    epochs: 500
     batch_size: 256
     optimizer: "adam"
     scheduler: "cosine"
@@ -40,7 +40,7 @@ training:
     save_path: "./det_model"
 
 gan:
-    epochs: 5000                # paper: 100k. extended run; diffusion shape did not improve beyond ~1k
+    epochs: 3000                # paper: 100k; bimodal case needs more than unimodal (best at ~800)
     batch_size: 1000            # paper: 1000
     n_critic: 5                 # paper: n_ct=5
     gp_lambda: 10               # paper: 10
@@ -50,13 +50,12 @@ gan:
     adam_beta1: 0.5             # paper: 0.5
     adam_beta2: 0.999           # paper: 0.999
     verbose: 100
-    checkpoint_interval: 500    # save checkpoint every N epochs; best selected by score below
+    checkpoint_interval: 300    # save checkpoint every N epochs; best selected by score below
     selection_std_weight: 1.0   # score = std_rel_err*w_std + wasserstein_gap*w_wgap
     selection_wgap_weight: 1.0  #       + gradient_penalty*w_gp + mean_abs_err*w_mean
     selection_gp_weight: 1.0
     selection_mean_weight: 0.0  # 0 = mean not used in selection
     mmd_lambda: 1.0             # CR-GAN MMD term on generator loss (not in paper). 0.0 to disable
-                                # tested at 0.0: no improvement to diffusion shape
     center_generator: true      # hard-center S: S_c(x,z0) = S(x,z0) - mean_k S(x,zk)
                                 # forces generator zero-mean per state; not in paper
     center_K: 16                # Monte Carlo draws for per-state mean in centering

@@ -6,8 +6,9 @@ __pycache__/
 due_env/
 .DS_Store
 *.mat
-**/det_model/
-**/gan_model/
+**/det_model/*
+**/gan_model/*
+!**/gan_model/*.png
 **/model/
 **/prior_model/
 examples/DampedPendulum/

@@ -76,34 +76,38 @@ class OracleDet(torch.nn.Module):
     def count_params(self):
         return 0
 
-if conf_train.get("use_oracle_det", False):
-    print(">>> Phase-1 ABLATION: D_theta replaced by the EXACT OU oracle (no Phase-1 training)")
-    det_net = OracleDet(float(vmin.flatten()[0]), float(vmax.flatten()[0]))
-    _os.makedirs(conf_train["save_path"], exist_ok=True)
-    torch.save(det_net, conf_train["save_path"] + "/model")
+# ---- eval_only mode ----
+EVAL_ONLY = bool(config_raw.get("eval_only", False))
+if EVAL_ONLY:
+    print(">>> eval_only=true: skipping Phase 1 and Phase 2 training, loading saved models.")
 else:
-    _arch = conf_net.get("det_arch", "resnet")
-    print(f"Phase-1 architecture: {_arch}")
-    det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
-    phase1_model = due.models.ODE(trainX, trainY, det_net, conf_train)
-    phase1_model.train()
-    phase1_model.save_hist()
+    if conf_train.get("use_oracle_det", False):
+        print(">>> Phase-1 ABLATION: D_theta replaced by the EXACT OU oracle (no Phase-1 training)")
+        det_net = OracleDet(float(vmin.flatten()[0]), float(vmax.flatten()[0]))
+        _os.makedirs(conf_train["save_path"], exist_ok=True)
+        torch.save(det_net, conf_train["save_path"] + "/model")
+    else:
+        _arch = conf_net.get("det_arch", "resnet")
+        print(f"Phase-1 architecture: {_arch}")
+        det_net = getattr(due.networks.fcn, _arch)(vmin, vmax, conf_net)
+        phase1_model = due.models.ODE(trainX, trainY, det_net, conf_train)
+        phase1_model.train()
+        phase1_model.save_hist()
 
-# Use the best deterministic map saved during Phase 1, then freeze it in SDE.__init__.
-det_net = torch.load(
-    conf_train["save_path"] + "/model",
-    map_location=conf_train["device"],
-    weights_only=False,
-)
+    # Use the best deterministic map saved during Phase 1, then freeze it in SDE.__init__.
+    det_net = torch.load(
+        conf_train["save_path"] + "/model",
+        map_location=conf_train["device"],
+        weights_only=False,
+    )
 
-# Phase 2 — WGAN-GP (Generator + Critic)
+    # Phase 2 — WGAN-GP (Generator + Critic)
+    generator = due.networks.gan.Generator(conf_net)
+    critic    = due.networks.gan.Critic(conf_net)
 
-generator = due.networks.gan.Generator(conf_net)
-critic    = due.networks.gan.Critic(conf_net)
-
-sde_model = due.models.SDE(trainX, trainY, det_net, generator, critic, conf_gan)
-sde_model.train()
-sde_model.save_hist()
+    sde_model = due.models.SDE(trainX, trainY, det_net, generator, critic, conf_gan)
+    sde_model.train()
+    sde_model.save_hist()
 
 # Evaluation
 

@@ -1,28 +1,31 @@
 seed: 0
-eval_only: false   # set true to skip training and re-run eval on saved models
+eval_only: false   # set true to skip training and load saved models for eval only
 
 dtype: single
 
-# Geometric Brownian Motion:  dx = mu x dt + sigma x dW,  mu=2, sigma=1
-# The full OU pipeline + Yeo-Johnson normalization (the ONLY change needed for GBM:
-# min-max crushes the exponential range; YJ discovers a log-like transform from data).
+# Geometric Brownian Motion (Chen & Xiu 2024, §5.1.2):
+#   dx = mu*x dt + sigma*x dW,   mu=2, sigma=1,  dt=0.01
+# IC: U(0, 2).  Test: x0=0.5, T=1.
 
 data:
     problem_dim: 1
     memory: 0
-    normalization: "yeojohnson"   # YJ needed: min-max crushes exponential range; YJ variance-stabilises multiplicative noise
+    normalization: "yeojohnson" # paper does not normalize. options: "none" | "minmax" | "yeojohnson"
+                                # yeojohnson needed: minmax crushes exponential range and breaks Phase 2
 
 network:
-    depth: 3
+    depth: 3                    # paper: 3x20 for generator and D_theta
     width: 20
-    critic_depth: 4
-    critic_width: 128
+    critic_depth: 4             # separate critic size (paper uses same 3x20 for all nets)
+    critic_width: 128           # options: any int; 4x128 needed to witness increment variance
     activation: "gelu"
-    latent_dim: 1
-    condition_on_state: true
-    det_arch: "gated_resnet"   # Phase-1 D_theta architecture: "resnet" or "gated_resnet"
+    latent_dim: 1               # paper: dim(z) = dim(x)
+    condition_on_state: true    # generator: (x,z) -> dy;  critic: (x0, y1:L) -> score
+    det_arch: "gated_resnet"    # options: "resnet" | "gated_resnet"
+                                # gated_resnet: D(x) = x + Affine(x) + sigmoid(a)*MLP(x), zero-init.
+                                # paper uses plain resnet.
 
-training:   # Phase 1 — deterministic ResNet D_theta (learned, multi-step)
+training:
     device: "cpu"
     valid: 0
     epochs: 250
@@ -32,27 +35,28 @@ training:   # Phase 1 — deterministic ResNet D_theta (learned, multi-step)
     learning_rate: 0.001
     verbose: 50
     loss: "mse"
-    use_oracle_det: false
-    phase1_single_step: false
+    use_oracle_det: false       # true = replace D_theta with exact map (ablation only)
+    phase1_single_step: false   # false = multi-step rollout loss (paper eq. 4.11)
     save_path: "./det_model"
 
-gan:                # Phase 2 — WGAN-GP (full working pipeline)
-    epochs: 1000
-    batch_size: 1000
-    n_critic: 5
-    gp_lambda: 10
-    learning_rate: 0.00005
-    lr_decay: true
+gan:
+    epochs: 1000                # paper: 100k; centering + strong critic converges in ~1k
+    batch_size: 1000            # paper: 1000
+    n_critic: 5                 # paper: n_ct=5
+    gp_lambda: 10               # paper: 10
+    learning_rate: 0.00005      # paper: 5e-5
+    lr_decay: true              # cosine decay lr -> lr_min over training (paper uses fixed lr)
     lr_min: 0.00001
-    adam_beta1: 0.5
-    adam_beta2: 0.999
+    adam_beta1: 0.5             # paper: 0.5
+    adam_beta2: 0.999           # paper: 0.999
     verbose: 10
-    checkpoint_interval: 100
-    selection_std_weight: 1.0
-    selection_wgap_weight: 1.0
+    checkpoint_interval: 100    # save checkpoint every N epochs; best selected by score below
+    selection_std_weight: 1.0   # score = std_rel_err*w_std + wasserstein_gap*w_wgap
+    selection_wgap_weight: 1.0  #       + gradient_penalty*w_gp + mean_abs_err*w_mean
     selection_gp_weight: 1.0
-    selection_mean_weight: 0.0
-    mmd_lambda: 1.0
-    center_generator: true
-    center_K: 16
+    selection_mean_weight: 0.0  # 0 = mean not used in selection
+    mmd_lambda: 1.0             # CR-GAN MMD term on generator loss (not in paper). 0.0 to disable
+    center_generator: true      # hard-center S: S_c(x,z0) = S(x,z0) - mean_k S(x,zk)
+                                # forces generator zero-mean per state; not in paper
+    center_K: 16                # Monte Carlo draws for per-state mean in centering
     save_path: "./gan_model"

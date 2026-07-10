@@ -55,8 +55,19 @@ difference is the data-derived normalization; nothing assumes the governing equa
 deterministic backbone (det_rollout 3.82) but blows up the full model (mean +68%, std ~7×) —
 coupled YJ (mean 3.5) stays best; the "undershooting" YJ D̃ is a *feature* (pre-compensates the
 noise Jensen lift). Decouple is OFF but kept (`phase1_normalization` commented; `WrappedDet`).
-**Jensen center-correction (Part 17) implemented**, config key `gan.jensen_correction: true`.
-Awaiting run results: expected mean ~3.5→~3.69. Then nonlinear / double-well / non-Gaussian / 2D.
+**Jensen correction (Part 17): NEGATIVE RESULT.** Delta-method correction: one-step gap ~0 in training region (estimation noise > signal); tail artifact at high-u (−0.07) catastrophically drops mean from 3.5→3.0. The 5% gap is multi-step/compounding, not a one-step bias. Correction OFF. The ~5% GBM mean gap is accepted as a documented residual.
+**Double-well (Part 18):** GAN learned bimodal behavior ✓; drift recovery excellent ✓;
+Phase 1 symmetry breaking found (D_theta→-0.7 from x0=0) — a saddle-point pathology not
+visible in the paper's x0=1.5 test protocol. Paper uses IC U(-2.5,2.5), test x0=1.5, T=300
+transition plot, PDF at T=0.5/10/30/100. Our DoubleWell.py used x0=0 — update needed.
+**TrigDrift §5.2.2 (Part 19):** Mean/std near-perfect; drift good within IC range; diffusion
+flat (~0.40 constant) instead of cosine-shaped 0.5|cos(2πx)| — same NLD pooled-loss pathology.
+Best epoch 900 (std_rel_err 0.43%). Phase 1 clean (no saddle, stable IC range).
+**Open issues (as of Part 19):** (1) Diffusion-shape miss: NLD, TrigDrift both show pooled
+loss → spatial average, not state-dependent shape. Needs state-aware objective or heteroscedastic
+generator. (2) generator_width/depth key missing from gan.py (only critic has separate width).
+(3) DoubleWell.py update needed (x0=1.5, T=300 transitions). (4) 2D examples not started.
+**Next to investigate:** architecture fix for diffusion miss — heteroscedastic generator S(x,z)=σ_net(x)·z or generator_width increase.
 
 ---
 
@@ -897,4 +908,179 @@ caffeinate -i python GBM.py   # trains fresh + applies correction in eval
 If δ is large or has oscillations, the training data binning is too coarse — increase n_bins.
 Std should NOT change materially (δ shifts the center, not the variance channel).
 
-**Status: awaiting run results.**
+**Result: NEGATIVE. Correction made things much WORSE (mean 3.5→3.0, std ~4.8→~2.3).**
+
+**Why it failed:**
+
+1. **Tail corruption.** At u > 0.3 (high-x end of training data), δ spikes to **−0.07** — 14× the main-body amplitude. This is a data artifact: at high x there are very few training pairs → m_x(u) estimated from few samples, divided by dT⁻¹/du which is LARGE (grows as x^(1/λ−1) for λ = −0.414) → tiny numerator noise ÷ large denominator → enormous δ. The clamped boundary fill carries this −0.07 to all u > 0.57, hammering every trajectory downward at late time.
+
+2. **One-step gap is already ~0 in the training region.** In the main body (u ∈ [−1.0, 0.3]) δ oscillates ±0.005 around zero — pure estimation noise, no systematic signal. This means: the model's per-step physical mean is ALREADY accurate in the training data distribution. The 5% rollout gap is NOT a one-step bias patchable by a per-step correction.
+
+3. **The 5% gap is a multi-step compounding effect**, not a one-step mean bias. D̃ in YJ space gives det_rollout ~2.54; noise Jensen-lifts it to ~3.5 over 100 steps. The remaining gap to 3.69 is a cumulative nonlinear interaction between compounding geometric steps and the nonlinear YJ inverse — not addressable by shifting D̃(u) at each step.
+
+**Conclusion.** Jensen delta-method correction: theoretically well-motivated but empirically wrong tool for this gap. The signal is below the estimation noise floor (σ(δ) ~ 0.025 >> true δ ~ 0.003), and the tail corruption is catastrophic. `jensen_correction` set back to `false`. Code kept as documented negative result.
+
+**The 5% GBM mean gap is a known, understood residual.** Fix requires either: (a) better D̃ Phase-1 coverage in the x∈[0.5,4] test-trajectory range, or (b) more training data densifying the high-x region. Both are data/architecture passes, not post-hoc corrections. Accepting the ~5% gap and moving to the next paper examples.
+
+---
+
+## Part 18 — Double-well (§5.2.3): bimodal generator works; Phase 1 saddle pathology found
+
+### Paper setup (from PDF, §5.2.3)
+- SDE: dx = (x−x³)dt + 0.5 dW. IC: **U(−2.5, 2.5)**. dt=0.01, 100 steps, L=40 window, N=10,000.
+- Test IC: **x0=1.5** (stable well), simulated to **T=300** to show inter-well transitions.
+- Key claim: "trajectories in training data do not contain transitions" (T_window=0.4 too short).
+  sFML reproduces transitions at O(10) timescale from training data with none.
+- Eval plots: PDF evolution at T=0.5, 10, 30, 100 from x0=1.5; drift/diffusion recovery.
+- Diffusion error: **"about 2%, rather acceptable"** (their words).
+- Paper runs 100,000 epochs, 3×20 nets (no hard-centering, no large critic in paper).
+
+### Our setup (diff from paper)
+- IC: U(−2, 2) instead of U(−2.5, 2.5) — minor.
+- Test IC: **x0=0** (saddle top) instead of x0=1.5 — this exposed the Phase 1 pathology.
+- 3,000 Phase-2 epochs (vs paper's 100k — but our improved pipeline converged faster).
+
+### What worked ✓
+- **Bimodal conditional at T=0.50 from x0=0**: perfect match to EM ground truth. Generator
+  successfully learned to spread trajectories into both wells. This is the hardest test.
+- **Drift recovery f(x)=x−x³**: excellent across [−1.8, 1.8] including the cubic nonlinearity.
+- **GAN convergence**: losses → ~0 within ~100 epochs; selection score 0.000716 at epoch 800.
+  One-step std_rel_err = 0.022% — essentially perfect at the per-step level.
+- **Stationary distribution**: bimodal histogram with peaks at ±1 reproduced.
+- **Training speed**: 240s/100 epochs on CPU — consistent with GBM/NLD (center_K=16 + MMD dominate).
+
+### Phase 1 symmetry breaking (the main finding, x0=0 specific)
+From x0=0, D_theta rolls out to **−0.7 by T=5** while EM mean stays at 0.
+- **Mechanism**: x=0 is an unstable fixed point (f'(0)=1>0). Under L=40-step unrolling with
+  stochastic gradient batches, finite-sample noise breaks the saddle's symmetry. Random init
+  of gated_resnet's affine/MLP causes D_theta to slide to the negative well.
+- **Not a GAN issue**: the full model (D_theta + generator) mean only reaches +0.06 (not −0.7).
+  The generator partially compensates D_theta's negative bias but slightly overcorrects.
+- **Diffusion asymmetry**: g(x) slopes 0.53→0.47 (left→right) instead of flat 0.5. This is a
+  downstream consequence of Phase 1 asymmetry — generator adds more noise on left to compensate.
+- **Invisible in paper's protocol**: paper tests from x0=1.5 (stable well), where D_theta
+  correctly stays near x=1 initially. The saddle pathology only shows from x0=0.
+- **Std underestimate**: ~10% (0.84 vs 0.93 EM) — connected to asymmetric diffusion.
+
+### Paper result vs ours
+| Metric | Paper | Ours (x0=0) |
+|---|---|---|
+| Drift recovery | Good | Excellent ✓ |
+| Diffusion error | ~2% | ~6% asymmetric (Phase 1 artifact) |
+| Bimodal conditional | ✓ | ✓ (T=0.5 from x0=0) |
+| D_theta from saddle | not tested | drifts to −0.7 (pathology) |
+| Mean rollout | (x0=1.5, good) | +0.06 residual (from x0=0) |
+
+### DoubleWell.py update needed (to match paper)
+Add x0=1.5 test path: run N_STEPS=30000 (T=300), show 2 sample trajectories with transitions;
+add PDF evolution subplots at T=0.5, 10, 30, 100 (compare sFML vs EM). This is the paper's
+headline result — demonstrating sFML learns transition behavior it never saw in training data.
+Currently DoubleWell.py only tests from x0=0. **Deferred; note in config `eval_only: true`.**
+
+### Conclusion
+The GAN (Phase 2) is NOT the bottleneck for double-well — it learned bimodal behavior correctly
+and fast. Phase 1 multi-step MSE at an unstable fixed point is a structural limitation: the saddle
+at x=0 is genuinely unstable under L-step rollout. This is a known failure mode of FML-style
+approaches at saddle points, not double-well specific. Document as a known limitation.
+
+---
+
+## Paper reference (Chen & Xiu 2024, J. Comput. Phys. 508, 112984)
+
+### Confirmed hyperparameters (from §5, p.9)
+- All 1D examples: N=10,000, L=40, dt=0.01, 100 EM steps, random window.
+- Network: **3 layers × 20 nodes** for ALL nets (generator, discriminator, D_theta).
+  Exception: 2D examples use 40 nodes per layer.
+- Training: n_ct=5, β₁=0.5, β₂=0.999, lr=5×10⁻⁵. **100,000 epochs** for all examples.
+- No normalization mentioned. No hard-centering. No MMD. No LR decay mentioned.
+  (Paper likely succeeds at 100k epochs via the Robbins-Monro / long-run convergence path
+  we ruled out in Part 13. Our centered + 4×128 pipeline reaches comparable quality at
+  ~1,000–3,000 epochs.)
+
+### Example-by-example paper setup
+| Example | IC | Test IC | T_test | Key eval |
+|---|---|---|---|---|
+| OU §5.1.1 | U(0, 0.25) | x0=1.5 | T=4 | mean/std, drift/diff, G(0.8), covariance |
+| GBM §5.1.2 | U(0, 2) | x0=0.5 | T=1 | mean/std, drift/diff, G(6) |
+| NLD §5.2.1 | U(−1, 1) | x0=−0.4 | T=10 | mean/std, drift/diff, G(−0.3) |
+| TrigDrift §5.2.2 | U(0.35, 0.7) | x0=0.6 | T=10 | mean/std, drift/diff, G(0.5) |
+| DoubleWell §5.2.3 | U(−2.5, 2.5) | x0=1.5 | T=300 | PDF at T=0.5/10/30/100, transitions |
+
+---
+
+## Part 19 — TrigDrift (§5.2.2): mean/std excellent, diffusion-shape miss (same NLD pathology)
+
+### Setup
+- SDE: dx = sin(2πx)dt + 0.5cos(2πx)dW, k=1, σ=0.5, dt=0.01. IC: U(0.35, 0.7), test x0=0.6.
+- Config: gated_resnet (near x=0.5, f(x)≈−2π(x−0.5) linear → affine captures it), minmax norm.
+- Phase 1: 500 epochs. Phase 2: 1200 epochs run (Ctrl-C at 1400), best epoch 900.
+- Best epoch 900: selection score 0.01242, std_rel_err 0.43%.
+
+### Results
+
+**Phase 1** — perfect. D_theta rollout from x0=0.6 tracks EM mean exactly to T=10; convergence
+to stable point x=0.5 is clean. Loss plateaued at 0.1584 within ~50 epochs. No symmetry breaking
+(IC range is entirely within the stable basin; no saddle exposed).
+
+**Mean & Std** — near-perfect. Both track EM across T=10. Stationary std ~0.12 matched exactly.
+This is the best Phase-2 result so far in terms of aggregate moment tracking.
+
+**Effective drift** — good within IC range [0.35, 0.70]. Sin(2πx) shape recovered; degrades
+outside support as expected (extrapolation). The zero-crossing at x=0.5 is correctly placed.
+
+**Effective diffusion — the miss:**
+- Analytical: 0.5|cos(2πx)| — peaks 0.5 at x=0.5, falls to ~0.15 near IC boundaries at
+  x=0.35/0.70, and zero at x=0.25/0.75 (outside training range).
+- sFML: nearly flat ~0.40 across entire range. Misses the cosine shape; outputs spatial average.
+- This is the identical NLD pooled-loss pathology: generator trained on pooled increment
+  distribution, which is dominated by the dense/central states (near x=0.5). Edge states
+  (near x=0.35/0.70) have both fewer samples AND smaller true diffusion → doubly under-weighted.
+  Generator outputs a constant near the density-weighted mean.
+
+**Conditional at x=0.5** — sFML too narrow. Analytical: N(0.5, 0.05²) (g(0.5)=0.5, std=0.05).
+sFML: visibly narrower. Consistent with g_pred(0.5)≈0.40 → predicted std≈0.04. ~20% underestimate
+at the peak of the diffusion curve.
+
+**Despite the diffusion miss, mean/std rollout is excellent.** The generator compensates in
+aggregate: even with wrong per-state diffusion shape, the ensemble variance integrates correctly
+over the T=10 trajectory (test IC x0=0.6 spends most time near x=0.5 where diffusion is
+over-estimated, which compensates). The per-state figure is wrong; the aggregate statistic is right.
+
+### Comparison with NLD
+| Aspect | NLD (§5.2.1) | TrigDrift (§5.2.2) |
+|---|---|---|
+| Diffusion shape | Bell σe^{−x²}: max 0.5 at 0, drops to 0.18 at ±1 | Cosine 0.5|cos(2πx)|: max 0.5 at x=0.5, falls to 0 at edges |
+| Variation ratio | ~3× (0.18–0.5) | ~3× (0.15–0.5) |
+| sFML diffusion | Flat ~0.48–0.50 (overestimates edges) | Flat ~0.40 (underestimates peak) |
+| Mean/std rollout | Excellent | Excellent |
+| Phase 1 | Clean | Clean |
+| Root cause | Pooled loss, sparse edges | Pooled loss, sparse edges |
+
+Both are the same structural issue. Different direction of miss (NLD overestimates edges,
+TrigDrift underestimates the peak) because the training density is different relative to the
+diffusion's shape, but same pooled-loss mechanism.
+
+### Open issues confirmed by TrigDrift
+1. **Diffusion-shape miss is systematic**, not example-specific. Affects any SDE where the
+   diffusion's spatial structure is in a poorly-covered region. NLD + TrigDrift both show it.
+2. **Fix options (unchanged from Part 14 analysis):**
+   - Heteroscedastic generator S(x,z) = σ_net(x)·z — regression for diffusion shape, adversarial
+     for residuals. Principled; equation-agnostic.
+   - Importance weighting by 1/ρ(x) — up-weights sparse edges. Equation-agnostic but high
+     weight-variance instability risk.
+   - Separate generator_width: wider generator sees stronger gradient signal for diffusion.
+     Currently generator uses config["width"]=20 (same as det_net); critic has separate 4×128.
+     Easy to add; worth testing as a cheap fix before the architectural change.
+3. **generator_width/depth key missing** — generator uses config["width"], critic has
+   critic_depth/critic_width. Add generator_depth/generator_width to gan.py before testing wider
+   generators.
+
+### Files
+- `examples/TrigDrift/generate_data.py` — SDE simulation, TD_train.mat / TD_test.mat
+- `examples/TrigDrift/config.yaml` — Phase 1: 500ep, Phase 2: 1000ep (updated from 3000)
+- `examples/TrigDrift/TrigDrift.py` — full pipeline + 4 eval plots
+- `examples/TrigDrift/check_phase1.py` — Phase 1 diagnostic (rollout + drift recovery grid)
+| Exp noise §5.3.1 | — | x0=0.4 | T=5 | mean/std, G(0.34), drift/diff |
+| Lognormal §5.3.2 | U(0.1, 2) | x0=1.5 | T=5 | mean/std, G(0.4), drift/diff |
+| 2D-OU §5.4.1 | U([−4,4]×[−3,3]) | x0=(0.3,0.4) | T=5 | mean/std, joint G(0,0) |
+| Oscillator §5.4.2 | U([−1.5,1.5]²) | x0=(0.3,0.4) | T=6.5 | mean/std, marginals G(−0.5,−0.5) |
