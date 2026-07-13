@@ -298,6 +298,7 @@ axes[0].set_title('Effective Drift')
 axes[1].plot(x_grid, diff_true, 'k-',  label='Analytical')
 axes[1].plot(x_grid, diff_pred, 'r.', ms=5, label='sFML')
 axes[1].set_xlabel('x'); axes[1].set_ylabel('Diffusion g(x)'); axes[1].legend()
+axes[1].set_ylim(0.25, 0.35)   # fixed window (sigma=0.3 +-0.05) so auto-scale can't magnify a small tilt
 axes[1].set_title('Effective Diffusion')
 
 plt.tight_layout()

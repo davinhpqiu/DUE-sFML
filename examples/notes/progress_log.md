@@ -1165,27 +1165,110 @@ Part 14, the OU/DoubleWell diffusion tilt + single-step-critic attempt in Part 2
 **critic**, to see if it learns the diffusion better than Adam. Trial on **OU first** (like the
 single-step-critic experiment), available to all examples.
 
-**Added (config-toggled, default `adam` ⇒ byte-identical to before):**
-- `due/utils.py` — `MuonAdamW`: Muon only optimises **2D** weight matrices; its docs require a
-  standard optimiser for every non-2D param (biases, the gated_resnet scalar gate). Wrapper routes
-  by `ndim` (Muon 2D / AdamW rest), drives both, exposes concatenated `param_groups` + `_step_count`
-  so the cosine LR scheduler works unchanged. `get_optimizer` gains a `muon` branch (Phase-1, via
-  `training.optimizer`).
-- `due/models/sde.py` — Phase-2 `opt_G`/`opt_C` switch on `gan.optimizer` (`adam` default / `muon`).
-  Prints `Phase-2 optimizer: <name>`.
-- `examples/{OU,GBM,NLD}/config.yaml` — surfaced `optimizer` key in the `gan:` section (`training:`
-  section already had one for Phase 1). Toggle works for all SDE examples regardless.
+**Why Muon needs a wrapper (the core complication).** Muon is a *matrix-level* optimiser: its step
+**orthogonalises** the momentum matrix (≈ nearest matrix with unit singular values, via a few
+Newton–Schulz iterations) so every singular direction of a weight matrix gets a comparable update.
+That operation is only defined for **2D** params — biases (1D), scalars (the gated_resnet gate),
+embeddings/conv have no orthogonalisation. So Muon *cannot* be `Muon(model.parameters())`; you must
+run **two optimisers** (Muon on 2D weights + AdamW on the rest). Its natural step size also differs
+from Adam (orthogonalised update ≈ unit-scale regardless of grad magnitude), so the LR must be
+retuned. This is intrinsic to the algorithm, not a PyTorch quirk — it's why all the plumbing below.
 
-**Blocker.** `torch.optim.Muon` needs **torch ≥ 2.13**; `setup.py` pins `torch==2.0.1`. The branch
-raises a clear error otherwise. → upgrade torch (test existing runs after — big jump) OR use a
-single-file Muon backport (lower risk; wire it into the `muon` branch as a fallback).
+**Added (config-toggled, default `adam` ⇒ byte-identical to before):**
+- `due/utils.py` — `MuonAdamW`: routes params by `ndim` (Muon 2D / AdamW rest), drives both
+  (step/zero_grad), exposes concatenated `param_groups`. `get_optimizer` gains a `muon` branch
+  (Phase-1 via `training.optimizer`).
+- `due/models/sde.py` — Phase-2 `opt_G`/`opt_C` switch on `gan.optimizer` (`adam` default / `muon`);
+  prints `Phase-2 optimizer: <name>`.
+- `examples/{OU,GBM,NLD,TrigDrift,DoubleWell}/config.yaml` — surfaced `optimizer` in the `gan:`
+  section (`training:` already had one for Phase 1) + LR-guidance comments (raise to ~1e-3 for muon).
+
+**Runtime fix — the scheduler.** First run errored `TypeError: MuonAdamW is not an Optimizer` —
+`CosineAnnealingLR` does an `isinstance(optimizer, Optimizer)` check and the wrapper isn't a real
+Optimizer. Fix: schedule the **real sub-optimisers** (Muon + AdamW *are* Optimizers) and step them
+together via a new `MultiScheduler` (utils). `get_schedule` now detects `MuonAdamW` and wraps each
+sub-optimiser (covers Phase-1 too); `sde.py` builds a `MultiScheduler` for `sched_G`/`sched_C` when
+muon. The loop's `if sched_G is not None: sched_G.step()` is unchanged. Both files compile.
+
+**Environment (resolved).** torch upgraded **2.12.1 → 2.13.0** (`hasattr(torch.optim,'Muon')` = True;
+the venv was already on 2.12.1, not the pinned 2.0.1). `setup.py` pin loosened `torch==2.0.1` →
+`torch>=2.0.1` (comment: Muon needs ≥2.13) to silence the pip conflict — re-`pip install -e .` to
+clear the stale installed metadata. Only a minor bump (2.12.1→2.13.0), low breakage risk, but re-run
+OU/GBM once to confirm the base pipeline before trusting Muon numbers.
 
 **Caveats before trusting a result:**
-- **LR:** GAN runs at 5e-5 (tuned for Adam). Muon wants a *much* larger lr (~1e-2); at 5e-5 the
-  critic barely moves and Muon will look bad. **Bump the GAN lr for the muon run** — the #1 knob.
-- Critic (55k params, 128×128) is where Muon is designed to help; generator (921 params) is ~moot.
-  Could add a critic-only Muon toggle if a cleaner test is wanted.
-- WGAN-GP is optimiser-sensitive; treat as an experiment, not an expected win. Weight decay 0.1
-  (Muon default) is aggressive for these tiny nets — tunable in `MuonAdamW`.
+- **LR is the #1 knob.** Muon's own default LR is 1e-3 (~20× the GAN's 5e-5); at 5e-5 the critic
+  barely moves. OU config now set to `gan.optimizer: muon`, `learning_rate: 1e-3`. If C-loss
+  explodes/NaNs, drop toward 3e-4.
+- **Confound:** OU also carries the Part-20 `single_step_critic` experiment — run muon with
+  `single_step_critic: false` (sequence critic) for a clean Adam-vs-Muon comparison.
+- Critic (bigger, ~128×128 matrices) is where Muon is designed to help; generator (~900 params) is
+  ~moot. Overall scale mismatch: Muon is built for large (LLM) matrices, our nets are tiny — payoff
+  genuinely uncertain. WGAN-GP is optimiser-sensitive; treat as an experiment. Muon weight-decay 0.1
+  (default) is aggressive for tiny nets — tunable in `MuonAdamW`.
 
-**Status:** wired + compiles; **untested** (needs torch ≥ 2.13). Uncommitted.
+**Result (OU, tested — Muon 1000 ep, lr 1e-3, sequence critic).** **Muon ≈ Adam — no effect on the
+diffusion tilt.** Mean tracks (1.5→~1.21), std ~8% over (0.23 vs 0.21), **effective diffusion still
+tilts up 0.30→0.35 across x∈[0.5,2.0]**, covariance ~15% high — a carbon-copy of the Adam baseline,
+and the critic-loss curve collapses to ~0 by ep~40 identically. Pooled metrics excellent (best ep
+100, std rel err 8e-4, `dy std real/fake` 0.0358/0.0358).
+
+**Why it couldn't help (the useful finding).** The tilt is **not an optimisation failure**: under
+Muon the critic converges perfectly (W-gap→0, GP→0, pooled increment std matched to 4 digits) —
+identical to Adam. Once the pooled increment marginal is matched, there is **no gradient left for
+the state-dependent variance**; a better optimiser just optimises the same blind objective. This
+narrows the cause definitively: **not critic size** (Part 6), **not budget** (Part 13), **not the
+optimiser** (this run) → it is the **objective/critic formulation** — a pooled sequence critic
+structurally cannot enforce constant per-state variance (DoubleWell shows the same tilt with uniform
+ICs, Part 20). The lever is what the critic *sees*: the **single-step critic** (Part 20) or a
+state-conditional / stratified variance term — NOT the optimiser. More Muon tuning won't move it
+(the critic already converges).
+
+**Status:** Muon fully wired (Phase 1 + 2, all SDE examples) + scheduler fix (`MultiScheduler`),
+torch 2.13 ready, runs cleanly. Tested on OU → **no improvement; optimiser RULED OUT as the
+diffusion-tilt lever.** Kept as a toggle (`gan.optimizer`, default adam; OU reverted to adam after
+the test). Uncommitted: `due/utils.py`, `due/models/sde.py`, `setup.py`, the 5 example gan configs.
+
+---
+
+## Part 22 — Increment scaling (professor's ×10): RESOLVES the OU diffusion tilt + std overshoot (the win)
+
+**Idea (professor).** The critic compares increment distributions, but raw increments are tiny
+(dy std ≈ 0.030). A per-state variance mismatch of ~6% is then ~0.0018 — **below the GP /
+estimation-noise floor**, so the critic literally cannot witness it (the Part-20 / Part-17 root
+cause, "GP floor > variance signal"). Multiply the increments the critic sees by ~10 so the same
+mismatch becomes ~0.018 — an order of magnitude above the floor — and the critic can finally
+resolve and correct the per-state variance.
+
+**Implemented (`increment_scale`, config toggle, default 1 = off).** In `sde.py`: the critic and
+gradient penalty see `s·y` (real and fake); the **generator, MMD, logged statistics, checkpoint
+selection, and prediction all stay in physical units**. So it's physics-neutral — only the critic's
+yardstick is rescaled. Modes: a number (fixed factor), or `"auto"` = data-derived `1/std(Δx)`
+(scales increments to ~unit std, equation-agnostic; ≈33 for OU).
+
+**Result — OU, single-step critic + `increment_scale: 10`, 1000 ep (best ep 500).** Best OU run to
+date; directly fixes the long-standing diffusion channel:
+
+| metric | prior (single-step, no scale) | ×10 increment scale |
+|---|---|---|
+| effective diffusion b̂(x) | **tilts UP** 0.30 → 0.32 (+6%) | **flat 0.30, slight DOWN to 0.28 at x=2** — matches paper Fig. 6 |
+| rollout std | ~8% **over** (0.225 vs 0.213) | ~4% slight **under** (~0.205) — tracks the curve |
+| covariance spectra | ~15% over | excellent match |
+| best increment std rel err | ~2e-4 | **6.5e-5** (~10× tighter); dy std pinned 0.0300/0.0300 per-state |
+| mean / drift / conditional | excellent | excellent (unchanged) |
+
+**Mechanism confirmed exactly as predicted.** The upward tilt — untouched by critic size (Part 6),
+budget (Part 13), or optimizer/Muon (Part 21) — vanished the instant the critic could *see* the
+variance signal. It was never architecture, duration, or optimizer: it was the **signal-to-floor
+ratio the critic operates at.** This closes the Part-20 diffusion-tilt investigation.
+
+**Notes.**
+- Now *slightly* under-shoots std (~4%) — ×10 may marginally over-correct; `increment_scale: "auto"`
+  or ~×5 could re-center it. Small; the result is already strong.
+- Best checkpoint was **epoch 500**; 500–1000 just oscillated ⇒ ~500–600 epochs suffice (not 1000).
+- The residual downward drift of b̂ past x≈1.5 is the data-free extrapolation region (training max
+  1.47) — now under-estimating instead of over, same direction as the paper's Fig. 6.
+- The mean's slight tail overshoot (1.22 vs 1.205) is the *separate* D̃ Phase-1 fixed-point residual,
+  not a diffusion issue.
+- **Not yet propagated** to GBM/NLD/TrigDrift/DoubleWell configs (they lack the `increment_scale`
+  key ⇒ default 1 = off). Candidate to try there (their diffusion misses are the same class).

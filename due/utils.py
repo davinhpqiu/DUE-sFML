@@ -456,8 +456,36 @@ def get_optimizer(name, model, lr):
         return MuonAdamW(model, lr)
     else:
         raise ValueError(f'unknown or unsupported optimizer: {name}')
-        
+
+
+class MultiScheduler:
+    """Steps several LR schedulers together — for MuonAdamW's sub-optimizers (Muon +
+    AdamW), since torch LR schedulers require a real Optimizer and reject the wrapper."""
+    def __init__(self, schedulers):
+        self.schedulers = schedulers
+
+    def step(self, *args, **kwargs):
+        for s in self.schedulers:
+            if s is not None:
+                s.step(*args, **kwargs)
+
+    def get_last_lr(self):
+        return [lr for s in self.schedulers if s is not None for lr in s.get_last_lr()]
+
+    def state_dict(self):
+        return {'schedulers': [s.state_dict() for s in self.schedulers]}
+
+    def load_state_dict(self, state_dict):
+        for s, d in zip(self.schedulers, state_dict['schedulers']):
+            s.load_state_dict(d)
+
+
 def get_schedule(optimizer, name, epochs, batch_size, ntrain):
+
+    # MuonAdamW is not a torch Optimizer; schedule each real sub-optimizer instead.
+    if isinstance(optimizer, MuonAdamW):
+        subs = [get_schedule(o, name, epochs, batch_size, ntrain) for o in optimizer.optimizers]
+        return MultiScheduler(subs) if subs and subs[0] is not None else None
 
     if name in ['cyclic_cosine', 'Cyclic_cosine', 'Cyclic_Cosine']:
         return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=(epochs//5)*(ntrain//batch_size))

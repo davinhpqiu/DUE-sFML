@@ -10,7 +10,7 @@ dtype: single
 data:
     problem_dim: 1
     memory: 0
-    normalization: "minmax"       # paper does not normalize. options: "none" | "minmax" | "yeojohnson"
+    normalization: "none"       # paper does not normalize. options: "none" | "minmax" | "yeojohnson"
 
 network:
     depth: 3                    # paper: 3x20 for generator and D_theta
@@ -43,8 +43,16 @@ gan:
     batch_size: 1000            # paper: 1000
     n_critic: 5                 # paper: n_ct=5
     gp_lambda: 10               # paper: 10
-    optimizer: "muon"           # "adam" (WGAN-GP betas) or "muon" (critic on 2D weights; needs torch>=2.13; Muon wants a LARGER lr)
-    learning_rate: 0.001      # 1e-3 for muon (paper/adam use 5e-5; Muon needs a much larger step). Cosine-decays to lr_min below.
+    # increment_scale: rescale the increments the critic + GP see so a small per-state variance
+    # mismatch clears the GP/noise floor (Part 22 — fixed the OU diffusion tilt + std overshoot).
+    # Physics unchanged: generator, MMD, stats and prediction stay in physical units. Choices:
+    #    1      -> off (raw increments, original behaviour)
+    #    10     -> professor's value; resolved OU (best result to date, best ckpt ~ep500)
+    #    5      -> gentler; try if 10 slightly under-shoots the std
+    #    "auto" -> data-derived 1/std(dx): scales increments to ~unit std (~33 for OU), equation-agnostic
+    increment_scale: 10
+    optimizer: "adam"           # "adam" (WGAN-GP betas) or "muon" (critic on 2D weights; needs torch>=2.13; Muon wants a LARGER lr)
+    learning_rate: 0.00005      # LR must match "optimizer" above:  adam -> 5e-5 (paper)  |  muon -> ~1e-3 (Muon needs a much larger step). Cosine-decays to lr_min.
     lr_decay: true              # cosine decay lr -> lr_min over training (paper uses fixed lr)
     lr_min: 0.00001
     adam_beta1: 0.5             # paper: 0.5
@@ -59,6 +67,6 @@ gan:
     center_generator: true      # hard-center S: S_c(x,z0) = S(x,z0) - mean_k S(x,zk)
                                 # forces generator zero-mean per state; not in paper
     center_K: 16                # Monte Carlo draws for per-state mean in centering
-    single_step_critic: false    # critic sees (x_t, Δx_t) pairs instead of L-step sequences
+    single_step_critic: true    # critic sees (x_t, Δx_t) pairs instead of L-step sequences
                                 # gives direct signal on per-step variance, no gradient attenuation
     save_path: "./gan_model"

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from numpy import savetxt
 
-from ..utils import MuonAdamW
+from ..utils import MuonAdamW, MultiScheduler
 
 
 class SDE:
@@ -117,16 +117,36 @@ class SDE:
         # un-centered generator's weakly-damped mean direction needs to converge.
         self.lr_decay = config.get("lr_decay", False)
         self.lr_min = config.get("lr_min", 1e-5)
+
+        def _cosine(opt):
+            # MuonAdamW is not a torch Optimizer — schedule each real sub-optimizer.
+            cos = lambda o: torch.optim.lr_scheduler.CosineAnnealingLR(
+                o, T_max=self.nepochs, eta_min=self.lr_min)
+            if isinstance(opt, MuonAdamW):
+                return MultiScheduler([cos(o) for o in opt.optimizers])
+            return cos(opt)
+
         if self.lr_decay:
-            self.sched_G = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.opt_G, T_max=self.nepochs, eta_min=self.lr_min)
-            self.sched_C = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.opt_C, T_max=self.nepochs, eta_min=self.lr_min)
+            self.sched_G = _cosine(self.opt_G)
+            self.sched_C = _cosine(self.opt_C)
         else:
             self.sched_G = self.sched_C = None
 
         states = torch.cat([self.trainX.unsqueeze(-1), self.trainY], dim=-1)
         self.real_increments = states[..., 1:] - states[..., :-1]
+
+        # Increment scaling (professor's suggestion). The critic compares increment
+        # distributions; raw increments are tiny (~0.03), so a small per-state variance
+        # mismatch sits below the GP/estimation-noise floor and the critic cannot witness
+        # it (Part 20). Scaling the increments the critic + GP see lifts that signal off
+        # the floor. Physics is unchanged: ONLY the critic's input is scaled — the
+        # generator, MMD, statistics and prediction all stay in physical units.
+        # "auto" => scale to ~unit std (data-derived, equation-agnostic); a number => that factor.
+        inc_scale_cfg = config.get("increment_scale", 1.0)
+        if isinstance(inc_scale_cfg, str) and inc_scale_cfg.lower() in ("auto", "unit", "unit_std"):
+            self.increment_scale = 1.0 / (self.real_increments.std().item() + 1e-12)
+        else:
+            self.increment_scale = float(inc_scale_cfg)
 
         if self.single_step_critic:
             # Flatten all N*L consecutive (x_t, Δx_t) pairs from training sequences.
@@ -331,9 +351,10 @@ class SDE:
                     else:
                         y_fake_batch = self.generate_increment_sequence(x0_batch)
 
-                gp = self.gradient_penalty(x0_batch, y_real_batch, y_fake_batch)
-                score_real = self.critic(x0_batch, y_real_batch).mean()
-                score_fake = self.critic(x0_batch, y_fake_batch).mean()
+                s = self.increment_scale
+                gp = self.gradient_penalty(x0_batch, s * y_real_batch, s * y_fake_batch)
+                score_real = self.critic(x0_batch, s * y_real_batch).mean()
+                score_fake = self.critic(x0_batch, s * y_fake_batch).mean()
                 loss_C = score_fake - score_real + self.gp_lambda * gp
 
                 self.opt_C.zero_grad()
@@ -360,7 +381,7 @@ class SDE:
                         y_fake_for_g = det_inc + self._stochastic_increment(x0_batch)
                     else:
                         y_fake_for_g = self.generate_increment_sequence(x0_batch)
-                    score_fake_for_g = self.critic(x0_batch, y_fake_for_g).mean()
+                    score_fake_for_g = self.critic(x0_batch, self.increment_scale * y_fake_for_g).mean()
                     loss_G = -score_fake_for_g
                     # Optional MMD regulariser: match the whole increment distribution
                     # (mean + variance + shape) to the real batch. Off when lambda=0.
@@ -463,6 +484,8 @@ class SDE:
             print("Critic mode:      sequence (L=%d steps)" % self.sequence_length)
         print("n_critic:        ", self.n_critic)
         print("GP lambda:       ", self.gp_lambda)
+        if self.increment_scale != 1.0:
+            print(f"Increment scale:  {self.increment_scale:.3g}x  (critic + GP see scaled increments; physics unchanged)")
         print("Batches / epoch: ", len(self.train_loader))
         print("Checkpoint every:", self.checkpoint_interval, "epochs")
         if self.center_generator:

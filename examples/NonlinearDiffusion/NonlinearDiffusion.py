@@ -49,6 +49,8 @@ else:
     det_net = torch.load(conf_train["save_path"] + "/model", map_location=conf_train["device"], weights_only=False)
 
     # ---- Phase 2 ----
+    if conf_gan.get("single_step_critic", False):
+        conf_net["sequence_length"] = 1   # single-step critic: (x_t, dx_t) pairs -> critic input dim 2d
     generator = due.networks.gan.Generator(conf_net); critic = due.networks.gan.Critic(conf_net)
     sde_model = due.models.SDE(trainX, trainY, det_net, generator, critic, conf_gan)
     sde_model.train(); sde_model.save_hist()
