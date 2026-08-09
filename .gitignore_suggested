@@ -1,0 +1,25 @@
+# --- suggested additions: keep the repo small enough to browse ---
+# Per-epoch checkpoints are large (24 MB for OU alone) and regenerable.
+# Keep generator_best / critic_best / *_final and the figures; drop the rest.
+examples/*/gan_model*/checkpoints/
+examples/*/det_model*/checkpoints/
+
+# One-off experiment output (keep the config + the sweep csv/png, drop the models)
+examples/OU/gan_model_overnight/
+examples/OU/gan_model_tanh/checkpoints/
+examples/OU/det_model_tanh/
+
+# LaTeX build artefacts
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+__pycache__/
+*.pyc
+due_env/

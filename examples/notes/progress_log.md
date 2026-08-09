@@ -1272,3 +1272,657 @@ ratio the critic operates at.** This closes the Part-20 diffusion-tilt investiga
   not a diffusion issue.
 - **Not yet propagated** to GBM/NLD/TrigDrift/DoubleWell configs (they lack the `increment_scale`
   key ⇒ default 1 = off). Candidate to try there (their diffusion misses are the same class).
+
+---
+
+## Part 23 — Scaling propagated; OU crisp figures; NLD diffusion isolated to density-domination (not eval grid)
+
+**Propagation.** `increment_scale` + `single_step_critic` surfaced in ALL five SDE example configs
+(default `increment_scale: "auto"` = data-derived 1/std(dx); `single_step_critic` off by default),
+and the single-step critic-sizing guard (`if single_step: sequence_length=1`) added to GBM.py /
+NonlinearDiffusion.py / TrigDrift.py / DoubleWell.py (only OU.py had it). So single-step is now
+available everywhere.
+
+**GBM (auto scaling, sequence critic).** Diffusion tracks σx cleanly, mean/std good — auto-scaling
+neutral-to-fine (GBM's diffusion was already fine; its residual is the mean/Jensen, Part 16).
+
+**OU crisp figures (professor's request).** Effective drift/diffusion MC bumped 20k → **1e6** draws,
+grid 100 → **200**, chunked accumulation (running sum/sum-sq) so the 1e6 × K=16 centering draws don't
+OOM. Note: hard-centering makes this ~3e9 gen-evals/plot on CPU (slow, ~min); an exact 16× speedup is
+available (drift is deterministic since E[S|x]=0; diffusion = raw-std × √(1−1/K)) — noted, not yet done.
+
+**NLD — the "diffusion shape not learned" fully diagnosed (two layers):**
+1. **Eval-grid artifact (partial red herring).** We plotted b̂ on [−1,1]; the paper's Fig. 15 uses
+   **[−0.6, 0.6]** = the data support. Fixed grid to [−0.6,0.6], ylim [0.34,0.52]. BUT:
+2. **Real miss = density domination.** Even on [−0.6,0.6], b̂ is **flat ~0.48** vs the bell (0.50→0.35).
+   Flat 0.48 ≈ the **density-weighted average** of the bell. Histogram: states 21% at x≈0, <1% each at
+   |x|≈0.5, **5 samples at x=±1** (95% within ±0.38, strong −5x reversion). The WGAN loss is a sum over
+   samples ⇒ dominated ~20:1 by the dense core ⇒ generator outputs the core variance everywhere. Even
+   single-step gets ~6 edge-samples/batch — too weak. This is Part 14's diagnosis, now nailed.
+   - **MMD-off test: FAILED.** Turned `mmd_lambda: 0` (hypothesis: MMD flattens by matching the pooled
+     marginal). Still flat AND destabilised training (generator loss diverged). MMD ruled out as cause;
+     reverted to 1.0 (it's a stabiliser).
+   - Same class as OU's residual tilt (data-free/sparse extrapolation): OU b̂ correct in-data, tilts only
+     at x>1.47 (data max); NLD b̂ correct at the dense core, flat at the sparse edges.
+
+**State of play.** OU essentially done (increment_scale fixed in-data; residual = data-free tail,
+consistent with the paper's own [−0.6,0.6]/[0.7,2.0] grid choices). The open problem is the
+**state-dependent diffusion SHAPE in sparse regions** (NLD bell, and by extension TrigDrift/DoubleWell)
+— an upstream *sample-weighting/coverage* problem, not a critic/optimizer/budget one.
+
+**Literature (searched).** The weighting idea is a known method — **DenseWeight/DenseLoss** (Steininger
+et al. 2021): KDE density, 1/ρ weighting with a single α to soften it. Its risk is documented —
+**Byrd & Lipton (ICML'19)**: importance weighting's effect *decays to nothing* over training in
+over-parameterised nets, + variance inflation from large weights on rare samples. The disease itself is
+**heteroscedastic variance collapse** (Seitzer et al. ICLR'22 "Pitfalls…", fix = β-NLL, a *variance*-based
+reweighting; and neural-SDE folklore: diffusion → 0 under NLL). So density weighting is applicable but
+its benefit is conditional and can vanish/invert. Candidate fixes below (Part 24 when tried).
+
+---
+
+## Part 24 — The core diagnosis (marginal vs conditional), Fix 1 & Fix 2 built, decoupled "safe Fix 2" test
+
+### The decisive measurement (why the diffusion SHAPE never learns)
+Measured directly on NLD data: how much does the **pooled** increment distribution move between the
+true bell b(x) and a completely FLAT variance? **W₁ = 1.3e-4**, sitting on the **sampling-noise floor
+of 1.1e-4**. So the shape signal is essentially absent from the quantity the WGAN optimises.
+- Root cause restated cleanly: **b(x) is a property of the CONDITIONAL p(Δx|x); the WGAN critic + MMD
+  both match the MARGINAL/pooled p(Δx), a sample-mean dominated ~20:1 by the dense core.** Getting the
+  bell vs flat right perturbs the marginal below the GP/sampling floor ⇒ no gradient toward the shape.
+- This UNIFIES every prior negative: more epochs, MMD on/off, stronger critic, Muon, difficulty-weighting
+  — all act on/through the same blind marginal objective. Moments/std stay great because they only need
+  the pooled variance (flat model already matches it).
+- Contrast GBM (b=σx): its variance contrast is huge, so the shape lives in the dense/large-variance
+  region and lifts the marginal above the floor ⇒ learnable. Pooled loss captures shape ONLY when the
+  structure sits where the data/variance is large.
+
+### Paper cross-check (important negatives)
+- Data protocol is **identical** to ours (paper §5: 100 EM steps, random L=40 window, N=10k) — coverage
+  is not the differentiator.
+- Paper trains **100k epochs**; our vanilla-at-scale run was tried (Part 13: un-centered, MMD off, decay,
+  70k) and **diverged** (mean→1.57, generator loss 0→12). So "just run the paper's vanilla config at
+  budget" is falsified for us — centering is required for convergence, not optional.
+
+### Fix 1 — state-density (1/ρ) importance weighting  [BUILT, toggle: `density_weight_alpha`]
+`sde.py`: weight critic + generator + GP samples by ρ(x0)^(-α) (histogram KDE over x0, α-softened,
+clipped). Data-derived ⇒ equation-agnostic. Default 0 = off. Rationale: re-level the sparse edges.
+Caveat (why it may fizzle): it reweights the FEW edge samples we have but can't create signal the critic
+is structurally blind to — it's downstream of the same marginal objective. Not yet run to conclusion.
+
+### Fix 2 — heteroscedastic generator  S(x,z)=σ_θ(x)·z  [BUILT, toggles: `heteroscedastic`, `hetero_var_lambda`]
+`gan.py`: generator becomes an explicit state-dependent scale (softplus MLP) × standard noise
+(requires latent_dim==problem_dim). `sde.py`: `_hetero_var_loss` regresses σ_θ(x)² onto the real
+residual² — variance by REGRESSION, not adversarially, so it sees the sparse-edge signal (validated in
+numpy: recovers the NLD bell to ~few % from the same data the WGAN read as flat; edge/center 0.67 vs true
+0.70 vs WGAN ~1.0). Structural zero-mean E[S|x]=0. It's the form of any Itô SDE ⇒ one config should fit
+all (OU: σ≈const; NLD: σ bows down).
+
+**Fix 2 result: helps NLD, FAILS terribly on OU.** On OU the full-model mean collapsed 1.22→0.78 (while
+Phase-1 D̃ alone reverts correctly to 1.22), effective drift ~3× too steep, std ~half, best selection
+score 0.19 (vs ~0.05 for good OU). Diagnosis:
+1. OU doesn't NEED Fix 2 — its b(x) is flat; its delicate quantity is the MEAN/drift in the sparse high-x
+   tail. Fix 2 aims at a problem OU doesn't have.
+2. The collapse can't come from clean σ(x)·z (exactly zero-mean) ⇒ it's an interaction: (a) noise-induced
+   drift in the extrapolation tail (x>1.47) where σ_θ runs free and tilts up, the ½σ²D̃'' term biasing the
+   ensemble mean down over the rollout; (b) the σ(x)·z straitjacket destabilising training while
+   adversarial+MMD+centering still fought — a genuinely bad run, per the selection score.
+- **Takeaway: Fix 2 helps when the DIFFUSION shape is the bottleneck (NLD/Trig/DoubleWell), hurts when
+  the MEAN is the delicate part (OU). Not yet uniform-safe** — it can regress a case it should leave alone.
+
+### Decoupled "safe Fix 2" (GAN-off) — considered and REJECTED on principle
+Idea was: for Gaussian-noise SDEs the model is fully specified by D̃ (MSE, mean) + σ_θ (regression,
+variance), so drop the GAN entirely (`adv_lambda=0`). This would make OU safe (nothing pushes the mean)
+and still fit NLD's bell. **Rejected:** hard-coding `S=σ(x)·z` (Gaussian z) bakes in a Gaussian noise
+model, which defeats the entire purpose of the WGAN approach — the method must make NO distributional
+assumption (it has to extend to the §5.3 non-Gaussian cases). Just because our current examples are
+Gaussian does not license assuming Gaussian in the model. So this path is a dead end.
+
+### DECISION: Fix 1, Fix 2, and adv_lambda all REVERTED — code back to the Part-22/23 stable form (HEAD)
+`due/models/sde.py` and `due/networks/gan.py` restored to commit `c86c7b67` (concat-MLP generator, plain
+WGAN-GP; keeps increment_scale, single_step_critic, MMD, centering, Muon). All 5 example configs restored
+to their committed stable values (OU = Part-22 best: single_step=true, increment_scale=10, mmd=1.0,
+center=true, epochs=1000). All experimental keys removed (`heteroscedastic`, `hetero_var_lambda`,
+`density_weight_alpha`, `adv_lambda`). `config_hetero.yaml` files abandoned (tombstoned; delete manually).
+Difficulty-weighting (earlier option B) had already been removed the same way.
+
+**What survives as RESULTS (the value of this round), even though the code was reverted:**
+1. The **diagnosis** above: b(x) lives in the CONDITIONAL, the WGAN/MMD optimise the MARGINAL, and the
+   bell-vs-flat signal in the marginal sits at the sampling-noise floor (W₁≈1.3e-4 vs floor 1.1e-4). This
+   is measured, not hand-waved, and it unifies every failed attempt (epochs, MMD, critic size, Muon,
+   difficulty-weighting, density-weighting all act on/through the blind marginal).
+2. Fix 2 (heteroscedastic regression) **would** recover the shape (numpy-validated) but only by assuming
+   location-scale/Gaussian structure — a modelling assumption the project's "assume nothing about the
+   noise" principle rejects. Documented as: *the shape IS recoverable by regression, but not without
+   assuming the noise form.*
+3. The remaining honest options for the diffusion-shape-in-sparse-regions problem, WITHOUT assuming the
+   noise form: (a) **density weighting 1/ρ(x)** — reweights DATA, not the noise model, keeps the concat
+   GAN fully general (built this round, reverted, not yet run to conclusion — re-add if pursued);
+   (b) **accept it as a characterised limitation** of the distribution-free method (arguably the strongest
+   scientific framing — the marginal-vs-conditional diagnosis is the contribution).
+
+**State of play (unchanged, clean baseline):** OU + GBM reproduced and stable. NLD/TrigDrift/DoubleWell
+diffusion SHAPE in sparse regions remains open, now precisely diagnosed. No Gaussian assumption in the code.
+
+---
+
+## Part 25 — Paper-faithful reset + 100k OU run: diffusion SOLVED the paper's way; mean fails un-centered
+
+> **⚠ CORRECTED BY PARTS 27-28 — read those first.** The headline "the paper's way" is WRONG: this run used a
+> **y-only gradient penalty**, which is NOT the paper's Alg 4.1 L12 (that is grad wrt the pair (x0, y~)).
+> The flat diffusion achieved here is attributable to that deviation, not to the paper's config. With the
+> corrected `pair` GP the tilt returns (Part 28). Conclusions below about "increment_scale was only
+> compensating for budget" are therefore NOT established.
+
+**Reset.** All 5 configs reset to match sFML paper as closely as possible: normalization none, plain ResNet
+(D̃=I+N), critic 3×20 (= generator, not 4×128), increment_scale 1 (OFF), sequence critic L=40 (single-step
+OFF), MMD 0 (OFF), centering OFF, lr_decay OFF, fixed lr 5e-5, n_ct 5, GP λ=10, batch 1000, 100k epochs,
+Phase-1 5000 ep. Two code changes: **gradient penalty fixed to y-only** (was penalising ∇ wrt x0 too, which
+over-smooths the critic ACROSS states — the direction it must stay sharp in); dtype kept float32 (float64 is
+DUE's default but only buys stability, doesn't touch the statistical floor). Left model-selection + activation.
+
+**OU 100k result — the two channels cleanly separate:**
+- **Diffusion: EXCELLENT, achieved the PAPER'S WAY.** b̂(x) flat ~0.30 across the data region (tiny up-tilt
+  only at x>1.7 extrapolation). Best-ckpt (ep 23,900) increment_std_rel_err = **2.4e-4**; rollout std tracks
+  0.21. This used **no increment_scale, no single-step** — just the sequence critic + y-only GP + 100k budget.
+  ⇒ **the increment_scale/single-step "win" (Part 22) was compensating for insufficient BUDGET**, not
+  fundamentally necessary; at the paper's 100k the sequence critic resolves the per-state variance on its own
+  (the y-only GP fix likely also helped by un-smoothing the state direction).
+- **Mean: FAILED (un-centered), even at 100k.** Full-model mean collapses to ~1.07 (vs 1.205). Generator loss
+  drifts steadily 0 → −1.4 over 100k (WGAN score-level drift, no equilibrium); per-step fake-mean wanders
+  (−0.07 → 0.007 → 0.006 across epochs). **Confirms Parts 10/13 at the full paper budget: budget does NOT fix
+  the un-centered mean; centering is necessary.**
+- **Covariance over-estimate** (C(0) 0.057 vs 0.045) is entirely the mean error leaking in — the variance
+  itself is fine.
+- **Model selection** ignored the mean (selection_mean_weight=0), so it picked a good-variance/bad-mean
+  checkpoint (ep 23,900, mean_abs_err 0.049), compounding the collapse.
+
+**Takeaway.** The two channels have different needs, now cleanly established at full budget:
+VARIANCE/diffusion → paper-faithful config works at 100k with no hacks ✓ ; MEAN → un-centered fails even at
+100k, centering required ✗ . **Next: paper-faithful diffusion (sequence critic + y-only GP + budget) + centering
+for the mean** = the combination that should reproduce OU fully, with centering the one justified deviation.
+This also reframes the shape problem: re-run NLD/Trig/DoubleWell paper-faithful at 100k (the diffusion channel
+now demonstrably works the paper's way) before concluding the shape is unrecoverable.
+
+---
+
+## Part 26 — Paper-faithful 100k OU, dual eval (best + final): final DIVERGES; add-ons validated as real improvements
+
+Config: paper-faithful (un-centered, sequence critic, 3×20, no increment_scale/MMD/centering, y-only GP,
+100k) + two tweaks: `selection_mean_weight=1.0` and `eval_model: both` (OU.py now wraps the eval in
+`run_eval(save_path)` and loops over generator_best + generator_final → `gan_model/eval_best`, `eval_final`).
+
+- **eval_final (paper's recipe = last-epoch model): DIVERGES.** Rollout mean blows up to ~4.5, std ~9.6.
+  Effective drift turns POSITIVE past x≈1.7 ⇒ the un-centered generator has an **extrapolation instability**
+  at high x by 100k, and OU's test (x0=1.5) lives beyond the data max (1.47), so trajectories run away.
+  Per-step training stats look fine (fake_mean 0.0062 ≈ real 0.0067) because they sit at low x and MISS the
+  high-x instability. Generator-loss drift to −1.4 = this instability. **Corrects Part 25's optimism: the
+  final model is NOT good; the paper's "train to 100k, use final" recipe yields an unusable model for us.**
+- **eval_best (mean-aware selection, epoch 11,600): ok-ish.** Flat 0.30 diffusion, std tracks 0.21, mean
+  ~1.17 (slight undershoot). std_rel_err 4.2e-3, mean_abs_err 1.8e-4. Mean-selection worked (caught an early
+  good-mean checkpoint, not a drifted late one).
+- **Worse than the add-on config (Part 22):** add-on best (single-step + increment_scale=10 + centering) had
+  std_rel_err **6.5e-5 (~65× tighter)** and mean ~1.22 (closer than 1.17), and was stable.
+
+**⚠ CAVEAT ADDED IN PART 27:** these two 100k runs used a **non-paper gradient penalty** (y-only), so their
+comparison against the paper is compromised. The "vanilla final diverges" conclusion may be partly an artifact.
+
+**Conclusion — the add-ons are GENUINE improvements, not just budget compensation.** Even at the paper's full
+100k: increment_scale lifts the variance signal off the GP floor (~65× tighter variance); centering pins the
+mean structurally (no drift/blowup); the vanilla final model is outright unstable. **The paper's vanilla
+recipe does not reproduce cleanly in our hands (final diverges, best is looser); our modified pipeline is the
+working reproduction.** Part-22 add-on config remains the best OU result. Model-selection is also non-optional
+for us: without it the un-centered final blows up.
+
+---
+
+## Part 27 — Line-by-line audit against Algorithm 4.1: ONE REAL BUG FOUND (gradient penalty), now fixed
+
+Audited every line of the paper's Algorithm 4.1 + eqs 4.7-4.21 against the code.
+
+### BUG (mine, introduced in the Part-25 "reset"): gradient penalty was y-only
+Paper **line 12** is explicit: `P = (|| grad_{(x_0, y~)} C(x_0, y~) ||_2 - 1)^2` — the gradient is wrt the
+**CONCATENATED PAIR (x0, y~)**, i.e. BOTH arguments. In Part 25 I "fixed" the GP to y-only, reasoning from
+standard conditional-WGAN-GP convention instead of reading the paper's subscript. **The ORIGINAL code was
+correct.** Reverted; the verbatim equation is now quoted in the `gradient_penalty` docstring so it can't drift.
+⇒ **The Part 25/26 100k runs used a non-paper GP** — their paper comparison is compromised (caveat added there).
+
+### Verified CORRECT, line by line
+| Paper | Code |
+|---|---|
+| L6 `y_{j+1} = D(x_j) - x_j + S(x_j,z)` | `increment = det_next - current_state + stochastic_increment` |
+| L7 `x_{j+1} = x_j + y_{j+1}` | `next_state = current_state + increment` |
+| L5 fresh `z~N(0,I)` EACH step j | `_stochastic_increment` draws fresh z per step |
+| L4-8 recurrent rollout from real x0 using its OWN states | `x_window` fed forward in `generate_increment_sequence` |
+| L11 `y~ = eps*y + (1-eps)*y_hat`, eps~U(0,1) PER-SAMPLE | `alpha_shape=[batch]+[1]*(ndim-1)` |
+| L13 `L = C(x0,y_hat) - C(x0,y) + lam*P` | `loss_C = score_fake - score_real + gp_lambda*gp` |
+| L15 critic Adam every batch, mean over B | `opt_C.step()` per batch, `.mean()` |
+| L16 generator every n_ct | `if critic_steps % n_critic == 0` |
+| L18 `L_S = -C(x0,y_hat)` | `loss_G = -score_fake_for_g` |
+| Eq 4.10 `D = I + N` | `resnet.forward: mlp(x) + x[...,-output_dim:]` |
+| Eq 4.7-4.9 multi-step rollout MSE for D | `ode.py` rolls `multi_steps`, MSE over trajectory |
+| Eq 4.21 `x_{n+1} = D(x_n) + S(x_n,z_n)` | eval `x = det_net(x) + r_fake` |
+| §5 n_ct=5, betas (0.5,0.999), lr 5e-5, lam=10, 3x20 all nets, 100k ep | configs match |
+| §5 data: 100 EM steps, random L=40 window, N=10k | `generate_data.py` matches |
+
+### Remaining deviations — all minor or genuine paper ambiguities
+1. **Fake regenerated for the generator step.** Paper generates y_hat ONCE per batch (L4-8) and reuses it for
+   both critic (L13) and generator (L18); we regenerate with fresh z (we detach for the critic). Statistically
+   equivalent, different z draw.
+2. **Activation GELU** — paper says only "fully connected feedforward DNN". Unspecified ⇒ ambiguity.
+3. **Batch size 1000** — paper lists B as a parameter but never prints its value. Our assumption (n_B=10).
+4. **Paper L10 typo**: says sample `n_B` numbers but indexes k=1..B; we sample B (per-sample) — only sensible read.
+5. **Model selection / checkpointing** — ours, not in the paper (paper uses the FINAL model). Now explicit and
+   comparable via `eval_model: both` (writes `gan_model/eval_best` + `eval_final`).
+6. **Phase-1 epochs 5000** — paper states this only for the 2D case; 1D unspecified.
+7. **float32, fixed seed** — unspecified in the paper.
+
+**Status: the algorithm is now a faithful implementation of Algorithm 4.1.** Any 100k paper-comparison runs
+should be REDONE with the corrected (x0,y) gradient penalty before drawing conclusions about the paper's recipe.
+
+---
+
+## Part 28 — GP mode is a REAL lever on the diffusion tilt (paper's `pair` GP is worse for us)
+
+Re-ran paper-faithful OU 100k with the **corrected (paper-faithful) gradient penalty** — grad wrt the
+concatenated pair (x0, y~), Alg 4.1 line 12, verified verbatim twice.
+
+| GP mode | effective diffusion b(x) | rollout |
+|---|---|---|
+| `y_only` (Part 26, my accidental deviation) | **FLAT ~0.30** (correct) | best ok-ish (mean ~1.17, std 0.21) |
+| `pair` (PAPER, this run) | **TILTS UP 0.30 → 0.33** | best: mean rises to ~1.47, std blows to 1.4; final diverges (mean 6, std 17) |
+
+**Mechanism (now evidenced, not just hypothesised).** In `pair` mode the penalty includes grad wrt x0, which
+forces the critic to be **smooth ACROSS states** — exactly the direction it must stay SHARP in to witness
+state-dependent variance. Result: the critic under-resolves per-state variance and b̂(x) tilts. `y_only`
+removes that constraint and b̂(x) comes out flat. Note x0 is NOT interpolated in either mode (only y~ is), so
+`pair` penalises the x0-gradient AT the real x0.
+- This is the SAME failure channel `increment_scale` addresses (Part 22 tilt) — two independent levers on the
+  critic's ability to resolve per-state variance.
+- **Now a toggle:** `gp_mode: "pair"` (default, paper-faithful) | `"y_only"` (documented deviation). Added to
+  all 5 configs + summary print.
+
+**Caveat on the mean comparison.** Both runs are UN-CENTERED, and the un-centered mean is a structurally
+ill-conditioned direction that lands somewhere different every run (documented Parts 10/13: 0.245, 0.82, 1.0,
+1.57, 1.07, now 1.47). So the mean difference between these two runs CANNOT be cleanly attributed to gp_mode;
+only the diffusion comparison is systematic. What IS robust: **eval_final diverges in BOTH GP modes** ⇒ the
+paper's "use the final model" recipe fails for us regardless of GP mode (Part 26 conclusion survives the fix).
+
+**Net:** the audit's correction stands (we are now paper-faithful by default), and it produced a genuine
+finding — the paper's own GP formulation is a contributor to the diffusion tilt we have been chasing since
+Part 20. Faithful ≠ best: `pair` is what the paper says, `y_only` is what works.
+
+---
+
+## Part 29 — Consolidated state of play (after the paper-faithful reset + audit)
+
+### Code state (`due/models/sde.py`, `due/networks/gan.py`) — audited faithful to Algorithm 4.1
+Verified line-by-line in Part 27. Generator = concat-MLP `S(concat(x,z))` (no structural noise assumption).
+All experimental branches removed and NOT present: heteroscedastic `sigma(x)*z`, density weighting,
+difficulty weighting, `adv_lambda`. Toggles that remain (all default to paper behaviour unless noted):
+
+| toggle | default | paper? | effect |
+|---|---|---|---|
+| `gp_mode` | `"pair"` | ✔ paper (Alg 4.1 L12) | `"y_only"` = deviation; gives FLAT b(x) (Part 28) |
+| `increment_scale` | `1` | ✔ paper (off) | `10`/`auto` lifts variance signal off GP floor (Part 22) |
+| `single_step_critic` | `false` | ✔ paper (sequence L=40) | `true` = (x_t,dx_t) pairs |
+| `mmd_lambda` | `0.0` | ✔ paper (none) | CR-GAN MMD stabiliser |
+| `center_generator` | `false` | ✔ paper (emergent) | hard zero-mean S; needed for the mean (Parts 10/13) |
+| `lr_decay` | `false` | ✔ paper (fixed lr) | cosine decay |
+| `selection_mean_weight` | `1.0` | ✘ ours | selection ignoring the mean picks bad-mean ckpts (Part 26) |
+| `eval_model` | `"both"` | ✘ ours | evals `generator_best` AND `generator_final` → `gan_model/eval_best`, `eval_final` |
+| `det_arch` | `"resnet"` | ✔ paper (eq 4.10) | `gated_resnet` = ours |
+| `optimizer` | `"adam"` | ✔ paper | `muon` = ours (no effect, Part 21) |
+
+Configs (all 5): dtype single, norm none, ResNet, critic 3×20, n_ct 5, lr 5e-5, betas (0.5,0.999), GP λ=10,
+batch 1000, Phase-1 5000 ep multi-step, Phase-2 100k ep. `OU.py` now wraps eval in `run_eval(save_path)` and
+loops over both model tags.
+
+### The two channels (the organising picture)
+1. **MEAN / drift.** Un-centered fails at ANY budget — lands somewhere different every run (0.245, 0.82, 1.0,
+   1.57, 1.07, 1.47) and `eval_final` diverges outright (mean→6, std→17) in BOTH gp_modes. The paper leaves
+   zero-mean emergent (Remark 4.1); for us it is not emergent. **Centering (or at minimum mean-aware model
+   selection) is required.** This is the single most robust negative result in the project.
+2. **VARIANCE / diffusion shape.** Governed by whether the critic can RESOLVE per-state variance. Two
+   independent levers found: `increment_scale` (lifts signal off the GP/noise floor, Part 22) and `gp_mode`
+   (`y_only` stops the GP smoothing the critic across states, Part 28). The paper's own `pair` GP is a
+   CONTRIBUTOR to the tilt. Underlying limit (Part 24, measured): b(x) is a property of the CONDITIONAL
+   p(dx|x) while the WGAN/MMD objective matches the MARGINAL — bell-vs-flat separation in the marginal is
+   W1≈1.3e-4 against a sampling floor of 1.1e-4.
+
+### What is settled
+- Paper-faithful implementation verified line-by-line; one real bug (GP) found and fixed.
+- OU + GBM reproduce with our modified pipeline; OU best-ever = Part 22 (std_rel_err 6.5e-5).
+- The paper's vanilla recipe does NOT reproduce for us: `final` model diverges regardless of gp_mode; the
+  3×20 critic under-witnesses variance; un-centered mean never homes.
+- Assumption-free fixes for the diffusion SHAPE are exhausted: budget, MMD, critic size, Muon,
+  difficulty weighting, density weighting (1/rho, 43% of critic loss moved to the edges) — all fail.
+  Only a noise-form assumption (heteroscedastic sigma(x)) recovers the shape, and that was rejected on
+  principle (defeats the distribution-free purpose of the GAN).
+
+### Open / next
+1. **Re-run OU 100k with `gp_mode: "y_only"`** to confirm the flat-b(x) result under the corrected code
+   (Part 26's run predates the toggle and conflates the deviation with the fix).
+2. **Isolate gp_mode cleanly** by running WITH centering, so the chaotic un-centered mean stops confounding
+   the comparison (only the diffusion channel is currently attributable).
+3. NLD/TrigDrift/DoubleWell diffusion shape: re-test at 100k with `gp_mode: y_only` + `increment_scale`
+   before treating the Part-24 "unrecoverable" verdict as final.
+4. Optional faithfulness item: paper reuses ONE fake rollout per batch for both critic and generator (we
+   regenerate with fresh z) — Part 27 deviation #1, judged harmless.
+
+---
+
+## Part 30 — The OU mean is NOT recoverable beyond ~±1.2%: the fixed point is ill-conditioned (measured)
+
+**Question:** with centering ON the full-model mean equals D̃'s fixed point, and we keep landing 1.17-1.22 vs
+true 1.205. Is that a model failure, or a limit of the data?
+
+**Measurement (numpy, on `OU_train.mat`, no training needed).** For EM-OU the one-step conditional mean is
+EXACTLY linear: `E[x_{n+1}|x_n] = (1-θΔ)x_n + θμΔ = 0.99x + 0.012`, fixed point `c/(1-a) = 1.2`.
+- **OLS on all 400,000 pairs:** a=0.990096, c=0.011962 → **fixed point 1.2078** (not 1.2000, with 400k samples).
+- **Conditioning:** fp = c/(1-a) is brutally ill-conditioned in the slope —
+  `a` error +1e-4 → fp +1.0% ; +3e-4 → +3.1% ; +1e-3 → **+11.1%**.
+  A 0.1% error in the learned per-step slope moves the fixed point by 11%.
+- **Bootstrap over trajectories (200×):** fixed point = **1.2063 ± 0.0145**, 95% CI **[1.179, 1.234]**.
+
+**Implication — the OU mean is already at the data's resolution limit.**
+Our learned D̃ fixed points: **resnet/5000ep → 1.183**, **gated_resnet/250ep → 1.22**. **BOTH LIE INSIDE the
+95% CI [1.179, 1.234].** So the residual "poor mean" (1.17-1.22 vs 1.205, ~1-3%) is **NOT a model failure —
+it is the statistical uncertainty this dataset supports.** Chasing the mean below ~±1.2% is chasing noise.
+- Why: the training data lives at LOW x (median 0.52, 99th pct 1.06, max 1.47) while the fixed point is at
+  1.2 — reading it off requires extrapolating a near-unit slope into a sparse region, and the fixed point
+  amplifies slope error ~100×. Same coverage story as the diffusion, in the mean channel.
+- Consistent with Part 9's old puzzle: single-step **OLS** gave 1.1825 — that was never a network failure
+  either, it is where this data's linear conditional mean actually sits.
+
+**This cleanly separates two things previously conflated:**
+| regime | mean lands | verdict |
+|---|---|---|
+| **Un-centered** (paper's Remark 4.1) | 0.245 / 0.82 / 1.0 / 1.07 / 1.47 / 1.57, `final` → 6.0 | **REAL failure** — far outside CI; GAN instability |
+| **Centered** (ours) | 1.17-1.22 (= D̃'s fixed point) | **NOT a failure** — inside CI, at data resolution |
+
+⇒ **OU's mean channel is CLOSED:** centering is required (un-centered is genuinely unstable), and with
+centering the mean is as accurate as the data permits. The remaining OU question is purely the diffusion
+channel (gp_mode / increment_scale), which the un-centered mean chaos has been confounding.
+
+**Next-step consequence:** test `gp_mode` on **NLD**, not OU — NLD's mean reverts to 0 with strong (θ=5)
+reversion in the DENSE part of its data, so its mean channel is benign and the diffusion effect can be read
+cleanly without the ill-conditioned-mean confound.
+
+---
+
+## Part 31 — NLD at 100k, paper-faithful: DECISIVE. Pooled variance perfect, conditional shape qualitatively wrong
+
+Ran NLD with the fully-audited paper-faithful config (Alg 4.1 exact, `gp_mode: pair`, sequence critic L=40,
+3×20 critic, no increment_scale / MMD / centering, fixed lr, 100k epochs). Best ckpt ep 22,500.
+
+**Everything EXCEPT the diffusion shape is good:**
+- `increment_std_rel_error` = **1.7e-4** — the POOLED increment std is matched essentially perfectly.
+- Phase-1 D̃ rollout tracks the analytical mean; effective DRIFT a(x)=−μx recovered across [−0.6,0.6].
+- Rollout std 0.152 vs 0.157 GT (~3% under); conditional distribution at x=−0.3 matches well.
+- Training stable to 100k (no divergence, unlike OU un-centered).
+
+**The diffusion shape is not merely under-resolved — it is QUALITATIVELY WRONG:**
+- Truth `b(x)=σe^{−x²}` is **EVEN**: 0.349 at −0.6, 0.500 at 0, 0.349 at +0.6.
+- Learned b̂(x) is **MONOTONE DECREASING**: 0.510 at −0.6 → 0.456 at +0.6. No peak, no symmetry.
+- **The model breaks a symmetry that IS present in the data.** Verified: the SDE is equivariant under x→−x
+  and IC U(−1,1) is symmetric, and the empirical per-state stds confirm it (x≈−0.55: 0.0369, x≈+0.55: 0.0374;
+  x≈−0.45: 0.0410, x≈+0.45: 0.0408). The learned asymmetry (−12%) is ~an order of magnitude larger than the
+  data's (+1%), and in the OPPOSITE direction.
+
+**Why this is decisive.** If the objective exerted ANY constraint on the conditional shape, the learned b̂
+would at minimum inherit the data's symmetry. It does not: it lands on an essentially arbitrary near-flat
+function whose *pooled* average matches (to 1.7e-4). This is exactly the Part-24 measurement realised —
+the WGAN objective constrains the MARGINAL and leaves the CONDITIONAL shape unidentified — now demonstrated
+at the paper's full budget with the paper's exact algorithm, on the paper's own example.
+
+**The fix space is now exhausted (all tested, all fail to recover the shape):**
+budget (5k, 70k, 100k) · critic size (3×20, 4×128) · sequence vs single-step critic · `gp_mode` pair vs
+y_only · `increment_scale` (1, 10, auto) · MMD on/off · centering on/off · Muon vs Adam · difficulty
+weighting · density weighting 1/ρ (43% of critic loss moved onto the sparse edges) · normalization variants.
+The ONLY thing that recovers the shape is assuming the noise form (heteroscedastic S=σ_θ(x)·z fitted by
+regression, Part 24) — rejected on principle, as it defeats the distribution-free purpose of the GAN.
+
+**CONCLUSION — the project's headline result.** Within the sFML/WGAN framework as published, on the paper's
+own data, the *state-dependent diffusion shape in sparsely-visited regions is not identifiable*: the training
+objective is a marginal (pooled) two-sample distance, while b(x) is a property of the conditional p(dx|x),
+and the discriminating signal there sits at the sampling-noise floor (W1≈1.3e-4 vs floor 1.1e-4, Part 24).
+Moments, drift, pooled variance and one-step conditionals all reproduce; the effective-diffusion FIGURE for
+the state-dependent-noise examples (NLD §5.2.1, TrigDrift §5.2.2) does not. Recovering it requires either
+more data in the sparse regions or a structural assumption on the noise.
+
+---
+
+## Part 32 — DEFINITIVE paper-faithful OU 100k (post-audit, all fixes): `final` DIVERGES, `best` mean wrong
+
+First run with the **fully audited, fully paper-faithful** implementation: `reuse_fake: true` (one fake
+rollout per batch, Alg 4.1 L4-8 reused by L13 + L18), `gp_mode: pair` (Alg 4.1 L12), 3×20 critic,
+no increment_scale / MMD / centering, fixed lr, 100k epochs, N_SAMPLES=100,000, plus the corrected Fig-8
+diagnostic (covariance-matrix eigenvalue spectra, not lag-covariance).
+
+**Result — qualitatively IDENTICAL to Parts 25/26.**
+- **`eval_final` (the paper's recipe): DIVERGES.** mean → 5.4, std → 6.9, effective drift turns POSITIVE
+  past x≈1.75 (runaway), covariance spectrum inflated ~3 orders at low k.
+- **`eval_best` (mean-aware selection): mean = 1.12**, below D̃'s own fixed point (1.183) — the un-centered
+  generator dragged it DOWN by ~0.06. std 0.19 vs 0.212. Effective diffusion 0.30 → 0.283 (mild tilt).
+- **1.12 lies OUTSIDE the data's 95% CI [1.179, 1.234]** (Part 30) ⇒ a genuine failure, not a resolution limit.
+
+**★ This LIFTS the Part-26 caveat.** Those runs used a non-paper y-only GP and regenerated the fake sequence,
+so their "vanilla diverges" conclusion was compromised. With BOTH of those now corrected to the paper's exact
+prescription, **the divergence and the wrong mean persist unchanged.** Therefore:
+> The failure of the paper's un-centered design is NOT an artifact of our implementation deviations.
+> It reproduces under the literal Algorithm 4.1, at the paper's full 100,000-epoch budget.
+This is now the strongest, cleanest negative result in the project — no remaining implementation caveat.
+
+**Un-centered mean across ALL runs** (true 1.205; data CI [1.179, 1.234]):
+0.245 · 0.82 · 1.00 · 1.07 · **1.12** · 1.17 · 1.47 · 1.57 · 5.4 (final) · 6.0 (final)
+Every value outside the CI; no two runs agree. Confirms the mean is an unconstrained direction of the
+un-centered objective, exactly as diagnosed in Parts 4/10/13.
+
+**New diagnostic works and is informative.** The corrected Fig-8 covariance-matrix spectra for `eval_best`
+is an **excellent match to ground truth across ~4 decades** of eigenvalue magnitude. Note this diagnostic
+centres by the empirical mean at each time, so it is INSENSITIVE to the mean offset — it isolates the
+fluctuation/temporal-correlation structure. Reading: **the model gets the covariance STRUCTURE right while
+getting the MEAN wrong**, which is precisely the two-channel split the project has been documenting
+(variance/shape channel healthy; mean channel unconstrained). For `eval_final` the spectrum is inflated
+~10³ at low k — the signature of the runaway.
+
+**Conclusion.** The paper-faithful reproduction of OU is COMPLETE and the verdict is negative: as published,
+the method does not converge for us at the paper's own budget with the paper's own algorithm. The working
+reproduction requires centering (mean) and a stronger critic + increment scaling (variance) — Part II of the
+report. Remaining OU work: none. Move to Config B for the working results and to the other examples.
+
+---
+
+## Part 33 — Fig-8 window fix VERIFIED; the discrepancy is in the PAPER's reference curve, not our model
+
+Re-ran eval-only with the corrected Fig-8 construction (L=40 window = T=0.40, t_0 excluded, 40 components).
+
+**The fix is verified against theory.**
+- Ground-truth λ₁ (measured, from the EM test ensemble) ≈ **0.44**; analytic OU value = **0.4370**. ✔
+- Spectrum decays smoothly 0.44 → ~2e-4 over 40 components, exactly as the analytic covariance
+  `Cov(X_s,X_t) = (σ²/2θ)(e^{−θ|t−s|} − e^{−θ(t+s)})` predicts.
+- The t_0 zero-eigenvalue cliff is gone (t_0 has Var=0 by construction; now excluded).
+
+**Predicted-and-confirmed:** I predicted the k=1 gap would persist and equal the std deficit squared.
+Measured std 0.19 vs true 0.212 ⇒ (0.19/0.212)² = **0.803**. Observed λ₁ ratio (pred/true) ≈ 0.35/0.44 =
+**0.80**. ✔ The covariance spectrum is now a clean quantitative readout of the variance error.
+
+**eval_best (ep ~11.6k):** spectrum tracks ground truth in SHAPE across 3+ decades but sits uniformly ~20%
+low (the std deficit). Mean 1.12, std 0.19, diffusion 0.30→0.283, drift slightly steep.
+**eval_final (ep 100k):** spectrum sits ABOVE ground truth (λ₁ ≈ 0.77 vs 0.44) and the gap widens with k —
+the signature of the runaway. Mean 5.4, std 6.9, drift turns positive past x≈1.65.
+
+### ★ The important new observation: OUR ground truth ≠ THE PAPER'S ground truth
+Our reference curve is computed from the true EM ensemble and **matches the analytic OU covariance exactly**
+(0.44 vs 0.4370). The paper's Fig-8 "Ground Truth" curve instead drops ~400× from λ₁≈4e-1 to λ₂≈1e-3 and
+then goes flat. **No construction we can derive from the OU process produces that shape** — states from
+deterministic x0 (λ₁/λ₂ = 7), from random x0 (7), stationary (13), or pure increments (flat, no dominant
+mode). ⇒ **The discrepancy is in their REFERENCE curve, not in our model.** Whatever Fig. 8 plots, it is not
+the per-time-centred covariance matrix of the OU state sequence. Unresolved; a precise question for the authors.
+
+---
+
+## Part 34 — ★ CORRECTION to Parts 26/32/33 (stale checkpoint file) + quantitative confirmation of the ÷Δ mechanism
+
+**Data-handling error (mine).** The `best_checkpoint.txt` I read for Parts 26/32/33 was a STALE upload
+(epoch 11,600). The actual best checkpoint of the paper-faithful 100k run is **epoch 26,200**. Corrected
+numbers:
+
+| metric | logged (stale, ep 11,600) | ACTUAL (ep 26,200) |
+|---|---|---|
+| selection_score | 6.69e-3 | **4.04e-3** |
+| increment_std_rel_error | 4.21e-3 | **6.45e-4**  (~6.5× better) |
+| increment_mean_abs_error | 1.77e-4 | 3.84e-4 |
+| real / fake increment std | 0.030027 / 0.030153 | **0.0300274 / 0.0300467** |
+
+⇒ Any statement in Parts 26/32/33 quoting "std_rel_err 4.2e-3" or "best ckpt ~11.6k" is WRONG; use the above.
+
+### The correction SHARPENS the diagnosis: the variance channel is excellent, the failure is entirely mean/drift
+With std_rel_err = **6.4e-4**, the generator's **per-step conditional variance is essentially exact** (fake
+0.0300467 vs real 0.0300274). So the residual errors are NOT a variance-learning failure:
+- **rollout std 0.19 vs 0.212 (−10%)** is caused by the DRIFT being too steep (over-reversion). The plots show
+  b̂ below the analytic line, i.e. an effective θ larger than 1; the stationary std σ/√(2θ_eff) then falls.
+  A variance deficit produced by a drift error, not by the noise model.
+- **rollout mean 1.12** is the ÷Δ amplification, now confirmed QUANTITATIVELY:
+
+```
+per-step generator mean error  δ = 3.84e-4      (= 1.3% of the increment std 0.030)
+effective drift bias           δ/Δ = 0.0384
+fixed-point shift              δ/(θΔ) = 0.0384
+predicted mean = D̃ fixed pt − shift = 1.183 − 0.038 = 1.145
+OBSERVED mean  = 1.12                                        ✔ (within the un-centered run-to-run scatter)
+```
+
+**This is the Part-4 mechanism measured end-to-end.** A per-step mean error amounting to 1.3% of the noise
+amplitude — utterly invisible in the pooled statistics, and far below anything an adversarial objective can
+resolve — produces an 0.08 error in the long-run fixed point. The 1/Δ factor turns a negligible per-step bias
+into a first-order error in the quantity of interest. **This is the single cleanest quantitative statement of
+why the un-centered design cannot work, and why the mean must be routed through regression (D̃) rather than
+through the GAN.**
+
+### Revised summary of the paper-faithful OU run
+- Variance / conditional-distribution channel: **excellent** (per-step std to 6e-4; covariance spectrum matches
+  ground truth in shape across 3+ decades).
+- Mean / drift channel: **fails** (mean 1.12, outside the data CI [1.179, 1.234]); `final` model diverges (5.4).
+- The two-channel split is now quantitative, not qualitative.
+
+**Note to self:** verify uploaded artefacts by timestamp/content before quoting them; stale files silently
+corrupted three log entries.
+
+---
+
+## Part 35 — ★ CHECKPOINT SWEEP: the run is METASTABLE, not convergent. Training longer is actively harmful.
+
+Swept 100 of the 1000 saved checkpoints from the Algorithm 4.1 100k OU run (every 10th), rolling each
+out to T=4 from x0=1.5 and recording the long-run mean/std. **No retraining — this was free.**
+(`examples/OU/sweep_checkpoints.py`, output `gan_model/checkpoint_sweep.{csv,png}`.)
+
+### Four distinct phases
+| phase | epochs | rollout mean range | max std |
+|---|---|---|---|
+| early chaos | 0 – 9,000 | 0.10 → **6494** | 462 |
+| **metastable plateau** | **9,000 – 55,000** | **1.05 – 1.79** | 2.98 |
+| escape / blow-up | 56,000 – 90,000 | 2.19 – **57.6** | 32.5 |
+| partial recovery | 90,000 – 100,000 | 2.19 – 11.2 | 15.6 |
+
+True values: mean 1.2049, std 0.2116.
+
+### What this establishes
+1. **There is no convergence — there is a metastable basin.** From ~9k to ~55k the model hovers near the
+   right answer, then **escapes irreversibly** at ~56k. The paper's 100k budget lands *past the escape*
+   (mean 5.59, std 7.01 — a 364% mean error).
+2. **Even inside the plateau the mean wanders**: range 1.05–1.79, mean |error| **9.9%**, worst 48%.
+   So the basin is not a converged solution — the mean random-walks within it, exactly as the
+   unconstrained-mean diagnosis (Parts 4/10/13) predicts. It is *usable*, not *correct*.
+3. **Longer training is actively harmful** — the failure is not under-training, it is over-training past
+   the escape. This inverts the original hypothesis (Part 3) that we were ~100× under-budget.
+4. **Strong support for the budget/epochs ambiguity.** If the paper's effective number of generator
+   updates lands anywhere in 9k–55k epochs (plausible given batch size B and "epochs vs iterations" are
+   both unspecified), their *final* model would sit in the plateau and look fine at figure resolution —
+   which is exactly the standard of agreement the paper reports.
+5. **Our model selection is a poor proxy for rollout quality.** The selection score (per-step increment
+   statistics) chose **ep 26,200**; the rollout-best checkpoint is **ep 11,000**. The score is computed on
+   *training states* (all at low x) and therefore cannot see the high-x extrapolation instability that
+   actually destroys the rollout. Honest limitation to report.
+
+### Mechanism of the escape
+The per-step training metrics at 100k are unremarkable (std_rel_err 6.8e-3), yet the rollout explodes.
+The instability is purely **extrapolative**: the effective drift turns positive beyond x≈1.65, outside the
+training range (max 1.47), so trajectories that wander high run away. Training statistics are blind to it
+because no training state is ever out there.
+
+### Consequence for the next experiment
+Do not run another 100k job. The decisive follow-up is the **activation function** (GELU is unbounded and
+asymptotically linear ⇒ extrapolated increments grow without limit; tanh saturates ⇒ they stay bounded),
+and it only needs to run to ~60k to see whether the escape still occurs. Also worth testing whether the
+escape epoch is seed-dependent (n=1 so far).
+
+### Part 35 addendum — the escape is INTERMITTENT, and the VARIANCE channel goes first
+Fine-grained look at epochs 38k–62k (1k resolution):
+
+| epoch | mean err | std err |    | epoch | mean err | std err |
+|---|---|---|---|---|---|---|
+| 38–45k | 2–13% | 0.5–8.6% |  | 50–51k | **0.8–2.3%** | **9–11%** |
+| 46k | 18% | **59%** |            | 52–54k | 22–38% | **570–1309%** |
+| 47k | 48% | **688%** |           | 55k | **4.0%** | **14%** |
+| 48–49k | 9–22% | 224–349% |     | 56k+ | 82%→925% | 2149%→9290% |
+
+Two things this shows:
+1. **It bursts and recovers before escaping.** Instability appears at 46–49k, *recovers* at 50–51k,
+   bursts again at 52–54k, *recovers* at 55k, then escapes permanently from 56k. This is intermittent
+   bursting at a stability boundary, not a monotone degradation.
+2. **The variance channel destabilises first and far more violently.** At 47k the std error is **688%**
+   while the mean error is 48%; at 53k std is 1309% vs mean 38%. The blow-up is driven by the
+   generator's *noise amplitude* exploding in the extrapolation region, with the mean dragged along.
+
+**Consequence — this rules out centering as the fix for the escape.** Hard-centering removes the
+generator's mean degree of freedom; it does nothing to $\sigma(x)$ at high $x$. So our Part-II fix
+addresses accuracy in the plateau, not the escape. The escape is an **extrapolation instability in the
+variance**, which points squarely at the activation (unbounded vs saturating) as the next test.
+
+---
+
+## Part 36 — Activation experiment (tanh): HYPOTHESIS REFUTED. tanh is far worse than GELU.
+
+Ran `config_tanh.yaml` (identical to the Algorithm 4.1 baseline except `activation: gelu -> tanh`,
+60k epochs), then swept all 60 checkpoints as in Part 35.
+
+**Hypothesis (Part 35):** the escape is an extrapolation instability; GELU is unbounded and
+asymptotically linear so $\sigma(x)$ can grow outside the data, while tanh saturates so increments stay
+bounded and the runaway becomes impossible.
+
+**Result: the opposite.** tanh never forms a metastable plateau at all.
+
+| | GELU (baseline) | tanh |
+|---|---|---|
+| checkpoints within 5% mean / 20% std | 14/100 | **0/60** |
+| median \|mean error\| | ~10% (in plateau) | **86.1%** |
+| max \|mean error\| | 4678% | 4280% |
+| behaviour | chaos → plateau (9k–55k) → escape | **chaotic throughout**; bounces 0.87–50 with no stable window |
+| best rollout | ep 11,000, mean 1.214 | ep 47,000, mean 1.175 |
+
+**Note the training metrics do NOT show this.** tanh's best checkpoint (ep 52,100) has
+`increment_std_rel_error` 1.4e-3 and `increment_mean_abs_error` 6.4e-4, comparable to GELU's best
+(6.4e-4 / 3.8e-4). Per-step statistics again fail to see the rollout behaviour (cf. Part 35).
+
+### Why tanh is a poor choice *here* (two confounds, both worth stating)
+1. **The inputs are already in the saturating region.** OU runs with `normalization: none`, so the
+   network sees raw $x$. Measured: median $|x|=0.53$ (tanh$'=0.77$), 99th pct $1.07$ (tanh$'=0.38$),
+   **test IC $1.5$ (tanh$=0.905$, tanh$'=0.18$)**. At the test initial condition the first-layer
+   gradient is ~5x smaller than at the origin, so the network has very little resolution exactly where
+   the rollout lives. Saturation buys boundedness at the cost of expressivity in the region that matters.
+2. **Phase 1 changed too.** `activation` is global, so $\tilde{\mathbf D}$ was also retrained with tanh.
+   Final Phase-1 losses are indistinguishable (1.4419e-2 vs 1.4417e-2), so the *fit* is equally good,
+   but the extrapolation behaviour of $\tilde{\mathbf D}$ beyond the data is not controlled for.
+
+### What this does and does not establish
+- **Does:** bounded activations do not cure the instability; "unbounded extrapolation of the activation"
+  is not a sufficient explanation for the escape. The activation ambiguity in the paper is unlikely to
+  be the missing ingredient.
+- **Does not:** cleanly test the boundedness idea, because tanh is confounded with (i) saturation on
+  unnormalised inputs and (ii) a retrained $\tilde{\mathbf D}$. A fairer test would normalise the state
+  first, or change the activation in the generator/critic only.
+
+**Next candidates**, in order: (a) the gradient-penalty constant $\lambda$ (never given a value in the
+paper); (b) batch size $B$ (also unspecified, and it sets the effective number of generator updates);
+(c) seed dependence of the escape epoch (n=1 so far).

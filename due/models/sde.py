@@ -79,6 +79,16 @@ class SDE:
         # instead of full L-step sequences. This gives the critic direct signal on
         # per-step conditional variance with no gradient attenuation through L steps.
         self.single_step_critic = config.get("single_step_critic", False)
+        # gp_mode: "pair" = paper-faithful (grad wrt both x0 and y~, Alg 4.1 line 12);
+        # "y_only" = treat x0 as a pure condition (standard conditional WGAN-GP).
+        # Part 28: "pair" re-introduces the OU diffusion tilt; "y_only" gives flat b(x).
+        self.gp_mode = str(config.get("gp_mode", "pair")).lower()
+        # reuse_fake: Alg 4.1 generates y_hat_{1:L} ONCE per batch (lines 4-8) and uses the
+        # SAME sequence in the critic loss (line 13) and the generator loss (line 18).
+        # True (default) = paper-faithful reuse (graph retained on generator-update batches).
+        # False = regenerate with fresh z for the generator step: an extra independent MC
+        # draw and much lower peak memory, but not literal pseudocode.
+        self.reuse_fake = bool(config.get("reuse_fake", True))
 
         self.best_checkpoint_score = float("inf")
         self.best_checkpoint_epoch = None
@@ -220,24 +230,53 @@ class SDE:
         return torch.stack(increments, dim=-1)
 
     def gradient_penalty(self, x0, y_real, y_fake):
+        """Gradient penalty, Algorithm 4.1 lines 10-12.
+
+        Paper line 11:  y~ = eps*y_real + (1-eps)*y_fake,  eps ~ U(0,1) per sample.
+        Paper line 12:  P = (|| grad_{(x0, y~)} C(x0, y~) ||_2 - 1)^2
+        The paper's subscript is the CONCATENATED PAIR (x0, y~) — verified verbatim.
+
+        gp_mode toggle:
+          "pair"   (default, PAPER-FAITHFUL) — penalise grad wrt both x0 and y~.
+          "y_only" (deviation) — penalise grad wrt y~ only, treating x0 as a pure
+                   condition (standard conditional-WGAN-GP practice). Note x0 is NOT
+                   interpolated in either mode (only y~ is), so in "pair" mode the
+                   x0-gradient is penalised AT the real x0.
+        Empirically (Part 28) "pair" re-introduces the OU diffusion up-tilt while
+        "y_only" gives a flat b(x): penalising grad_x0 forces the critic to be smooth
+        ACROSS states, which is the very direction it must stay sharp in to witness
+        state-dependent variance. Kept as a toggle: "pair" for faithfulness, "y_only"
+        as a documented, mechanistically-motivated deviation.
+        """
         batch = y_real.size(0)
         alpha_shape = [batch] + [1] * (y_real.ndim - 1)
         alpha = torch.rand(alpha_shape, device=self.device, dtype=y_real.dtype)
 
-        x_hat = x0.detach().requires_grad_(True)
         y_hat = (alpha * y_real + (1 - alpha) * y_fake.detach()).requires_grad_(True)
-        score = self.critic(x_hat, y_hat)
 
-        grad_x, grad_y = torch.autograd.grad(
-            outputs=score,
-            inputs=(x_hat, y_hat),
-            grad_outputs=torch.ones_like(score),
-            create_graph=True,
-            retain_graph=True,
-        )
-        grad = torch.cat(
-            [grad_x.reshape(batch, -1), grad_y.reshape(batch, -1)], dim=1
-        )
+        if self.gp_mode == "y_only":
+            score = self.critic(x0.detach(), y_hat)
+            grad_y = torch.autograd.grad(
+                outputs=score,
+                inputs=y_hat,
+                grad_outputs=torch.ones_like(score),
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+            grad = grad_y.reshape(batch, -1)
+        else:  # "pair" — paper-faithful
+            x_hat = x0.detach().requires_grad_(True)
+            score = self.critic(x_hat, y_hat)
+            grad_x, grad_y = torch.autograd.grad(
+                outputs=score,
+                inputs=(x_hat, y_hat),
+                grad_outputs=torch.ones_like(score),
+                create_graph=True,
+                retain_graph=True,
+            )
+            grad = torch.cat(
+                [grad_x.reshape(batch, -1), grad_y.reshape(batch, -1)], dim=1
+            )
         return ((grad.norm(2, dim=1) - 1) ** 2).mean()
 
     def _mmd2(self, y_fake, y_real):
@@ -343,18 +382,39 @@ class SDE:
                 x0_batch = x0_batch.to(self.device)
                 y_real_batch = y_real_batch.to(self.device)
 
-                with torch.no_grad():
+                # --- Alg 4.1 lines 4-8: build the fake increment sequence ONCE per batch ---
+                # The paper generates y_hat_{1:L} here and references the SAME symbol in the
+                # critic loss (line 13) and the generator loss (line 18). reuse_fake=True
+                # (default, paper-faithful) keeps this sequence's autograd graph alive and
+                # reuses it for the generator update; the critic sees a detached copy.
+                # reuse_fake=False regenerates with fresh z for the generator step — an extra
+                # independent MC draw and much lower peak memory, but NOT literal pseudocode.
+                gen_step_due = ((self.critic_steps + 1) % self.n_critic == 0)
+                keep_graph = self.reuse_fake and gen_step_due
+
+                if keep_graph:
                     if self.single_step_critic:
-                        # One-step fake: D(x_t) - x_t + S(x_t, z)
-                        det_inc = self.det_net(x0_batch) - x0_batch
+                        with torch.no_grad():
+                            det_inc = self.det_net(x0_batch) - x0_batch
                         y_fake_batch = det_inc + self._stochastic_increment(x0_batch)
                     else:
                         y_fake_batch = self.generate_increment_sequence(x0_batch)
+                else:
+                    with torch.no_grad():
+                        if self.single_step_critic:
+                            # One-step fake: D(x_t) - x_t + S(x_t, z)
+                            det_inc = self.det_net(x0_batch) - x0_batch
+                            y_fake_batch = det_inc + self._stochastic_increment(x0_batch)
+                        else:
+                            y_fake_batch = self.generate_increment_sequence(x0_batch)
+
+                # The critic must never backprop into the generator -> detached copy.
+                y_fake_det = y_fake_batch.detach()
 
                 s = self.increment_scale
-                gp = self.gradient_penalty(x0_batch, s * y_real_batch, s * y_fake_batch)
+                gp = self.gradient_penalty(x0_batch, s * y_real_batch, s * y_fake_det)
                 score_real = self.critic(x0_batch, s * y_real_batch).mean()
-                score_fake = self.critic(x0_batch, s * y_fake_batch).mean()
+                score_fake = self.critic(x0_batch, s * y_fake_det).mean()
                 loss_C = score_fake - score_real + self.gp_lambda * gp
 
                 self.opt_C.zero_grad()
@@ -370,12 +430,17 @@ class SDE:
                 totals["score_real"] += score_real.item()
                 totals["score_fake"] += score_fake.item()
                 totals["real_increment_std"] += y_real_batch.std().item()
-                totals["fake_increment_std"] += y_fake_batch.std().item()
+                totals["fake_increment_std"] += y_fake_det.std().item()
                 totals["real_increment_mean"] += y_real_batch.mean().item()
-                totals["fake_increment_mean"] += y_fake_batch.mean().item()
+                totals["fake_increment_mean"] += y_fake_det.mean().item()
 
                 if self.critic_steps % self.n_critic == 0:
-                    if self.single_step_critic:
+                    if self.reuse_fake:
+                        # Alg 4.1 line 18: SAME y_hat as the critic saw (graph retained).
+                        # The critic forward below is fresh, so it uses the just-updated
+                        # critic parameters — no autograd version conflict.
+                        y_fake_for_g = y_fake_batch
+                    elif self.single_step_critic:
                         with torch.no_grad():
                             det_inc = self.det_net(x0_batch) - x0_batch
                         y_fake_for_g = det_inc + self._stochastic_increment(x0_batch)
@@ -484,6 +549,8 @@ class SDE:
             print("Critic mode:      sequence (L=%d steps)" % self.sequence_length)
         print("n_critic:        ", self.n_critic)
         print("GP lambda:       ", self.gp_lambda)
+        print("GP mode:         ", self.gp_mode, "(pair = paper Alg 4.1 L12; y_only = x0 as pure condition)")
+        print("Fake reuse:      ", self.reuse_fake, "(True = paper: one y_hat per batch for BOTH critic + generator)")
         if self.increment_scale != 1.0:
             print(f"Increment scale:  {self.increment_scale:.3g}x  (critic + GP see scaled increments; physics unchanged)")
         print("Batches / epoch: ", len(self.train_loader))

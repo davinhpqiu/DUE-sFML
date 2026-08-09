@@ -122,7 +122,9 @@ plt.tight_layout(); plt.savefig(save_path + "/mean_std.png", dpi=150); plt.close
 print("Saved mean_std.png")
 
 # ---- Effective drift a(x)=-mu x and diffusion b(x)=sigma e^{-x^2}, recovered on a grid ----
-x_grid = np.linspace(-1.0, 1.0, 41); N_DD = 20_000
+# Grid = paper Fig. 15 range [-0.6, 0.6] = the data-supported region (states are ~95% within
+# +-0.4 due to strong -5x reversion; |x|>0.6 is <0.5% of data, i.e. pure extrapolation).
+x_grid = np.linspace(-0.6, 0.6, 100); N_DD = 20_000
 drift_pred = np.zeros_like(x_grid); diff_pred = np.zeros_like(x_grid)
 with torch.no_grad():
     for i, xg in enumerate(x_grid):
@@ -136,6 +138,7 @@ ax[0].plot(x_grid, -MU * x_grid, 'k-', label='Analytical  -mu x'); ax[0].plot(x_
 ax[0].set_xlabel('x'); ax[0].set_ylabel('Drift a(x)'); ax[0].set_title('Effective Drift'); ax[0].legend()
 ax[1].plot(x_grid, SIGMA * np.exp(-x_grid**2), 'k-', label='Analytical  sigma e^{-x^2}'); ax[1].plot(x_grid, diff_pred, 'r.', label='sFML')
 ax[1].set_xlabel('x'); ax[1].set_ylabel('Diffusion b(x)'); ax[1].set_title('Effective Diffusion'); ax[1].legend()
+ax[1].set_ylim(0.34, 0.52)   # paper Fig. 15 zoom on the mild in-data bell curvature
 plt.tight_layout(); plt.savefig(save_path + "/drift_diffusion.png", dpi=150); plt.close()
 print("Saved drift_diffusion.png")
 

@@ -1,5 +1,5 @@
 seed: 0
-eval_only: false  # set true to skip training and load saved models for eval only
+eval_only: true   # eval-only: figures were regenerated from saved models (no retraining needed)
 
 dtype: single
 
@@ -15,19 +15,19 @@ data:
 network:
     depth: 3                    # paper: 3x20 for generator and D_theta
     width: 20
-    critic_depth: 4             # separate critic size (paper uses same 3x20 for all nets)
-    critic_width: 128           # options: any int; 4x128 needed to witness increment variance
+    critic_depth: 3             # separate critic size (paper uses same 3x20 for all nets)
+    critic_width: 20           # options: any int; 4x128 needed to witness increment variance
     activation: "gelu"
-    latent_dim: 1               # paper: dim(z) = dim(x)
+    latent_dim: 1               # noise dim Z. Paper §4.3: "the dimension of z, n_s>=1, is a choice made by USER" — NOT specified. Z=1 is our choice.
     condition_on_state: true    # generator: (x,z) -> dy;  critic: (x0, y1:L) -> score
-    det_arch: "gated_resnet"    # options: "resnet" | "gated_resnet"
+    det_arch: "resnet"    # options: "resnet" | "gated_resnet"
                                 # gated_resnet: D(x) = x + Affine(x) + sigmoid(a)*MLP(x), zero-init.
                                 # paper uses plain resnet
 
 training:
     device: "cpu"
     valid: 0
-    epochs: 250
+    epochs: 5000  # paper trains D_theta multi-step (2D case: 5000 ep)
     batch_size: 256
     optimizer: "adam"
     scheduler: "cosine"
@@ -39,10 +39,12 @@ training:
     save_path: "./det_model"
 
 gan:
-    epochs: 1000                # paper: 100k; centering + strong critic converges in ~1k
+    epochs: 100000                # paper: 100k; centering + strong critic converges in ~1k
     batch_size: 1000            # paper: 1000
     n_critic: 5                 # paper: n_ct=5
     gp_lambda: 10               # paper: 10
+    reuse_fake: true            # paper Alg 4.1: ONE fake rollout per batch reused by critic (L13) + generator (L18). false = regenerate w/ fresh z (cheaper memory, not literal)
+    gp_mode: "pair"             # "pair" = paper Alg 4.1 L12 (grad wrt x0 AND y); "y_only" = x0 as pure condition (flat b(x), Part 28)
     # increment_scale: rescale the increments the critic + GP see so a small per-state variance
     # mismatch clears the GP/noise floor (Part 22 — fixed the OU diffusion tilt + std overshoot).
     # Physics unchanged: generator, MMD, stats and prediction stay in physical units. Choices:
@@ -50,10 +52,10 @@ gan:
     #    10     -> professor's value; resolved OU (best result to date, best ckpt ~ep500)
     #    5      -> gentler; try if 10 slightly under-shoots the std
     #    "auto" -> data-derived 1/std(dx): scales increments to ~unit std (~33 for OU), equation-agnostic
-    increment_scale: 10
+    increment_scale: 1
     optimizer: "adam"           # "adam" (WGAN-GP betas) or "muon" (critic on 2D weights; needs torch>=2.13; Muon wants a LARGER lr)
     learning_rate: 0.00005      # LR must match "optimizer" above:  adam -> 5e-5 (paper)  |  muon -> ~1e-3 (Muon needs a much larger step). Cosine-decays to lr_min.
-    lr_decay: true              # cosine decay lr -> lr_min over training (paper uses fixed lr)
+    lr_decay: false              # cosine decay lr -> lr_min over training (paper uses fixed lr)
     lr_min: 0.00001
     adam_beta1: 0.5             # paper: 0.5
     adam_beta2: 0.999           # paper: 0.999
@@ -62,11 +64,12 @@ gan:
     selection_std_weight: 1.0   # score = std_rel_err*w_std + wasserstein_gap*w_wgap
     selection_wgap_weight: 1.0  #       + gradient_penalty*w_gp + mean_abs_err*w_mean
     selection_gp_weight: 1.0
-    selection_mean_weight: 0.0  # 0 = mean not used in selection
-    mmd_lambda: 1.0             # CR-GAN MMD term on generator loss (not in paper). 0.0 to disable
-    center_generator: true      # hard-center S: S_c(x,z0) = S(x,z0) - mean_k S(x,zk)
+    selection_mean_weight: 1.0  # include per-step mean error in checkpoint selection (was 0 -> picked bad-mean checkpoints)
+    mmd_lambda: 0.0             # CR-GAN MMD term on generator loss (not in paper). 0.0 to disable
+    center_generator: false     # hard-center S: S_c(x,z0) = S(x,z0) - mean_k S(x,zk)
                                 # forces generator zero-mean per state; not in paper
     center_K: 16                # Monte Carlo draws for per-state mean in centering
-    single_step_critic: true    # critic sees (x_t, Δx_t) pairs instead of L-step sequences
+    single_step_critic: false    # critic sees (x_t, Δx_t) pairs instead of L-step sequences
                                 # gives direct signal on per-step variance, no gradient attenuation
+    eval_model: "both"          # eval both "best" (selection) and "final" (paper) models -> gan_model/eval_best, eval_final
     save_path: "./gan_model"

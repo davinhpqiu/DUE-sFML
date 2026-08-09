@@ -1,66 +1,54 @@
 seed: 0
-eval_only: false   # set true to skip training and load saved models for eval only
-
+eval_only: false
 dtype: single
-
-# Nonlinear diffusion (Chen & Xiu 2024, §5.2.1):
-#   dx = -mu*x dt + sigma*e^{-x^2} dW,   mu=5, sigma=0.5,  dt=0.01
-# IC: U(-1, 1).  Test: x0=-0.4, T=4.
-# Open issue: bell-shaped diffusion not recovered — see sfml_status.md
-
 data:
-    problem_dim: 1
-    memory: 0
-    normalization: "minmax"     # paper does not normalize. options: "none" | "minmax" | "yeojohnson"
-
+  problem_dim: 1
+  memory: 0
+  normalization: minmax
 network:
-    depth: 3                    # paper: 3x20 for generator and D_theta
-    width: 20
-    critic_depth: 4             # separate critic size (paper uses same 3x20 for all nets)
-    critic_width: 128           # options: any int; 4x128 needed to witness increment variance
-    activation: "gelu"
-    latent_dim: 1               # paper: dim(z) = dim(x)
-    condition_on_state: true    # generator: (x,z) -> dy;  critic: (x0, y1:L) -> score
-    det_arch: "gated_resnet"    # options: "resnet" | "gated_resnet"
-                                # gated_resnet: D(x) = x + Affine(x) + sigmoid(a)*MLP(x), zero-init.
-                                # paper uses plain resnet.
-
+  depth: 3
+  width: 20
+  critic_depth: 4
+  critic_width: 128
+  activation: gelu
+  latent_dim: 1
+  condition_on_state: true
+  det_arch: gated_resnet
 training:
-    device: "cpu"
-    valid: 0
-    epochs: 250
-    batch_size: 256
-    optimizer: "adam"
-    scheduler: "cosine"
-    learning_rate: 0.001
-    verbose: 50
-    loss: "mse"
-    use_oracle_det: false       # true = replace D_theta with exact map (ablation only)
-    phase1_single_step: false   # false = multi-step rollout loss (paper eq. 4.11)
-    save_path: "./det_model"
-
+  device: cpu
+  valid: 0
+  epochs: 1000
+  batch_size: 256
+  optimizer: adam
+  scheduler: cosine
+  learning_rate: 0.001
+  verbose: 50
+  loss: mse
+  use_oracle_det: false
+  phase1_single_step: false
+  save_path: ./det_model
 gan:
-    epochs: 5000                # paper: 100k. extended run; diffusion shape did not improve beyond ~1k
-    batch_size: 1000            # paper: 1000
-    n_critic: 5                 # paper: n_ct=5
-    gp_lambda: 10               # paper: 10
-    increment_scale: "auto"     # rescale increments the critic+GP see to clear the GP/noise floor (Part 22 fixed OU). "auto"=data-derived ~unit std; 1=off; or a number (OU used 10). Physics unchanged.
-    single_step_critic: false   # true = critic sees (x_t, dx_t) pairs (input dim 2d) not L-step sequences. OU win = single-step + increment_scale.
-    optimizer: "adam"           # "adam" (WGAN-GP betas) or "muon" (critic on 2D weights; needs torch>=2.13; Muon wants a LARGER lr)
-    learning_rate: 0.00005      # LR must match "optimizer" above:  adam -> 5e-5 (paper)  |  muon -> ~1e-3 (Muon needs a much larger step or the critic won't move)
-    lr_decay: true              # cosine decay lr -> lr_min over training (paper uses fixed lr)
-    lr_min: 0.00001
-    adam_beta1: 0.5             # paper: 0.5
-    adam_beta2: 0.999           # paper: 0.999
-    verbose: 100
-    checkpoint_interval: 500    # save checkpoint every N epochs; best selected by score below
-    selection_std_weight: 1.0   # score = std_rel_err*w_std + wasserstein_gap*w_wgap
-    selection_wgap_weight: 1.0  #       + gradient_penalty*w_gp + mean_abs_err*w_mean
-    selection_gp_weight: 1.0
-    selection_mean_weight: 0.0  # 0 = mean not used in selection
-    mmd_lambda: 1.0             # CR-GAN MMD term on generator loss (not in paper). 0.0 to disable
-                                # tested at 0.0: no improvement to diffusion shape
-    center_generator: false      # hard-center S: S_c(x,z0) = S(x,z0) - mean_k S(x,zk)
-                                # forces generator zero-mean per state; not in paper
-    center_K: 16                # Monte Carlo draws for per-state mean in centering
-    save_path: "./gan_model"
+  epochs: 2000
+  batch_size: 1000
+  n_critic: 5
+  gp_lambda: 10
+  reuse_fake: true
+  gp_mode: pair
+  increment_scale: auto
+  single_step_critic: false
+  optimizer: adam
+  learning_rate: 5.0e-05
+  lr_decay: true
+  lr_min: 1.0e-05
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  verbose: 100
+  checkpoint_interval: 100
+  selection_std_weight: 1.0
+  selection_wgap_weight: 1.0
+  selection_gp_weight: 1.0
+  selection_mean_weight: 1.0
+  mmd_lambda: 1.0
+  center_generator: true
+  center_K: 16
+  save_path: ./gan_model

@@ -7,8 +7,8 @@ Test : x0=-0.4, 1000 EM steps (T=10).
 import numpy as np, scipy.io as sio, os
 
 MU, SIGMA, DT = 5.0, 0.5, 0.01
-N_TRAIN, STEPS, L = 10_000, 100, 40
-N_TEST, X0_TEST, STEPS_TEST = 10_000, -0.4, 1000
+N_TRAIN, STEPS, L = 10000, 100, 40
+N_TEST, X0_TEST, STEPS_TEST = 10000, -0.4, 1000
 SEED = 0
 
 def euler_maruyama(x0, n_steps, rng):
