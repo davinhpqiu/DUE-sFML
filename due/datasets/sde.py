@@ -1,6 +1,7 @@
 import numpy as np
 np.random.seed(0)
 from scipy.io import loadmat
+from .normalizer import Normalizer
 
 class sde_dataset():
     """
@@ -42,6 +43,9 @@ class sde_dataset():
         self.problem_dim  = config["problem_dim"]
         self.memory_steps = config.get("memory", 0)
         self.dtype        = config["dtype"]
+        # "minmax" (default, original behaviour) or "yeojohnson" (data-derived power
+        # transform per coordinate -> variance-stabilises multiplicative noise, e.g. GBM).
+        self.normalization = config.get("normalization", "minmax")
 
     def load(self, file_path_train, file_path_test):
         """
@@ -134,6 +138,64 @@ class sde_dataset():
                     np.asarray(vmin).astype(self.dtype),
                     np.asarray(vmax).astype(self.dtype))
 
+    def load_sequence(self, file_path_train, file_path_test):
+        """
+        Load trajectory data in the recurrent form used by Algorithm 4.1.
+
+        Returns:
+            tuple:
+                - trainX: normalised initial states, shape (N, d).
+                - trainY: normalised future states, shape (N, d, L).
+                - test_data: raw test trajectories, shape (N_test, d, T_test+1).
+                - vmin/vmax: per-variable scaling, shape (1, d).
+        """
+        try:
+            data = loadmat(file_path_train)
+        except NotImplementedError:
+            print("Your mat file is too large. Be patient.")
+            import mat73
+            data = mat73.loadmat(file_path_train)
+        try:
+            data = data["trajectories"]
+        except:
+            raise ValueError("Please name your dataset as trajectories.")
+
+        N = data.shape[0]
+        d = self.problem_dim
+        L = data.shape[2] - 1
+        if data.shape[1] != d:
+            raise ValueError(
+                'Only support data arrays with size (N,d,L+1), '
+                'N being number of trajectories, d being the number of state '
+                'variables, L being the recurrent sequence length.'
+            )
+        print("Dataset loaded, {} trajectories, {} variables, recurrent length {}".format(
+            N, d, L))
+
+        data_norm, vmin, vmax = self.normalize_trajectory(data)
+        trainX = data_norm[:, :, 0]
+        trainY = data_norm[:, :, 1:]
+        print("Training trajectories are normalized")
+        print("Initial state shape {}.".format(trainX.shape),
+              "Future state sequence shape {}.".format(trainY.shape))
+
+        if file_path_test is None:
+            return (trainX.astype(self.dtype), trainY.astype(self.dtype),
+                    np.asarray(vmin).astype(self.dtype),
+                    np.asarray(vmax).astype(self.dtype))
+        else:
+            try:
+                test_raw = loadmat(file_path_test)
+            except NotImplementedError:
+                print("Your mat file is too large. Be patient.")
+                import mat73
+                test_raw = mat73.loadmat(file_path_test)
+            test_data = test_raw["trajectories"]
+            return (trainX.astype(self.dtype), trainY.astype(self.dtype),
+                    test_data.astype(self.dtype),
+                    np.asarray(vmin).astype(self.dtype),
+                    np.asarray(vmax).astype(self.dtype))
+
     def normalize(self, data_X, data_Y):
         """
         Normalise input and output data into the range [-1, 1].
@@ -176,3 +238,24 @@ class sde_dataset():
         target_Y = np.clip(target_Y, -1, 1)
 
         return target_X, target_Y, vmin, vmax
+
+    def normalize_trajectory(self, data):
+        """
+        Normalise full trajectories into [-1, 1] with one scale per state variable.
+
+        Args:
+            data (ndarray): Trajectories, shape (N, d, L+1).
+
+        Returns:
+            tuple:
+                - data_norm: Normalised trajectories with the same shape as data.
+                - vmin: Per-variable minimum, shape (1, d).
+                - vmax: Per-variable maximum, shape (1, d).
+        """
+        # Fit the (toggleable) normaliser and keep it on the dataset so the example's
+        # eval code can invert predictions:  data_loader.normalizer.inverse(...).
+        self.normalizer = Normalizer(self.normalization).fit(data)
+        data_norm = self.normalizer.transform(data)
+        vmax = np.max(data, axis=(0, 2), keepdims=False).reshape(1, self.problem_dim)
+        vmin = np.min(data, axis=(0, 2), keepdims=False).reshape(1, self.problem_dim)
+        return data_norm, vmin, vmax

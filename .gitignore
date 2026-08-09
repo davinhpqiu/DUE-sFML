@@ -6,3 +6,44 @@ __pycache__/
 due_env/
 .DS_Store
 *.mat
+**/det_model/*
+**/gan_model/*
+!**/gan_model/*.png
+**/model/
+**/prior_model/
+examples/DampedPendulum/
+examples/DampedPendulum_partial/
+examples/DampedPendulum_partial_noise/
+examples/DoubleOscillator/
+examples/Lorenz63/
+examples/RobertsonOSG/
+examples/ViscousBurgers/
+examples/VorticityOSG/
+examples/WakeCylinder/
+tests/
+
+examples/OU/config_overnight.yaml
+examples/OU/det_model_overnight/
+examples/OU/gan_model_overnight/
+
+# --- sFML study: variant run dirs (same rule as gan_model/det_model above) ---
+**/gan_model_*/*
+**/det_model_*/*
+# ...but keep the small, useful artefacts from every run
+!**/gan_model*/*.png
+!**/gan_model*/*.csv
+!**/gan_model*/best_checkpoint.txt
+!**/det_model*/*.png
+# checkpoints are large and regenerable
+**/checkpoints/
+
+# LaTeX build artefacts
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz

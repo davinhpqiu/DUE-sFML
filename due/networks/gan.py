@@ -157,9 +157,10 @@ class Critic(nn):
     """
     Critic network C_psi for Wasserstein GAN training.
 
-    Maps a (state, residual) pair to a raw scalar score:
+    Maps a state and either a one-step residual or a residual sequence to a raw
+    scalar score:
 
-        score = C_psi(x_n, r)
+        score = C_psi(x_0, y_{1:L})
 
     The critic is trained to maximise the gap between scores for real and fake residuals. 
     The generator is trained to make fake residuals indistinguishable from real ones.
@@ -168,7 +169,8 @@ class Critic(nn):
         config (dict): A dictionary containing configuration parameters.
             - problem_dim (int): The number of state variables d.
             - memory (int): Number of past states in the state input (default 0).
-            - condition_on_state (bool): If True, Critic receives (x, r); if False, only r.
+            - sequence_length (int): Number of increments scored by the critic.
+            - condition_on_state (bool): If True, Critic receives (x, y); if False, only y.
             - depth (int): The number of hidden layers.
             - width (int): The number of neurons in each hidden layer.
             - activation (str): The activation function name.
@@ -201,14 +203,21 @@ class Critic(nn):
         # condition_on_state = False (unconditional):  input is r only
         self.condition_on_state = config.get("condition_on_state", True)
 
-        # State input d*(memory+1). Residual r is d-dimensional.
-        # Hence full input when conditioning is d*(memory+1) + d.
-        state_input_dim = config["problem_dim"] * (self.memory_steps + 1)
-        self.input_dim  = (state_input_dim + config["problem_dim"]
-                           if self.condition_on_state else config["problem_dim"])
+        self.problem_dim = config["problem_dim"]
+        self.sequence_length = config.get("sequence_length", 1)
 
-        self.depth = config["depth"]
-        self.width = config["width"]
+        # State input d*(memory+1). Increment sequence y_{1:L} has d*L entries.
+        state_input_dim = config["problem_dim"] * (self.memory_steps + 1)
+        sequence_input_dim = config["problem_dim"] * self.sequence_length
+        self.input_dim  = (state_input_dim + sequence_input_dim
+                           if self.condition_on_state else sequence_input_dim)
+
+        # Critic may use its OWN (larger) capacity, independent of the generator, via
+        # critic_depth / critic_width. Falls back to the shared depth/width if unset.
+        # Rationale: the critic must be a strong enough Wasserstein witness to police
+        # the increment VARIANCE (weak 3x20 critic gives W-gap~0 while std differs 5x).
+        self.depth = config.get("critic_depth", config["depth"])
+        self.width = config.get("critic_width", config["width"])
         self.activation = get_activation(config["activation"])
         self.dtype = config["dtype"]
 
@@ -235,30 +244,28 @@ class Critic(nn):
             print("self.dtype error. The self.dtype must be either single or double.")
             exit()
 
-    def forward(self, x, r):
+    def forward(self, x, y):
         """
         Forward pass through the Critic.
 
-        Called twice per batch during the critic update step:
-          1. With r = r_batch (real residuals from data) - should give high scores
-          2. With r = r_fake  (residuals from Generator) - should give low scores
-        And once per batch during the generator update step:
-          3. With r = r_fake  (residuals from Generator) - Generator wants high scores here
+        Called during the critic update with real and generated increment
+        sequences. Called during the generator update with generated increments
+        only, where the generator tries to increase the critic score.
 
         Args:
-            x (torch.Tensor): Normalised state window, shape (batch, d*(memory+1)).
+            x (torch.Tensor): Normalised initial state/window, shape (batch, d*(memory+1)).
                               Ignored when condition_on_state is False.
-            r (torch.Tensor): Residual to score, shape (batch, d).
-                              Can be a real residual (from data) or fake (from Generator).
+            y (torch.Tensor): Increment sequence to score. Shape can be
+                              (batch, d) for one-step training or (batch, d, L)
+                              for Algorithm 4.1 sequence training.
 
         Returns:
             torch.Tensor: Raw Wasserstein score, shape (batch, 1).
-                          Higher = critic judges r as more likely real.
+                          Higher = critic judges y as more likely real.
                           No sigmoid — this is an unbounded real number.
         """
-        # Concatenate state and residual when conditioning.
-        # For OU with memory=0: x is (batch,1), r is (batch,1) → inp is (batch,2).
-        inp = torch.cat([x, r], dim=-1) if self.condition_on_state else r
+        y_flat = y.reshape(y.shape[0], -1)
+        inp = torch.cat([x, y_flat], dim=-1) if self.condition_on_state else y_flat
 
         # Hidden layers with activation
         for l in self.layers[:-1]:

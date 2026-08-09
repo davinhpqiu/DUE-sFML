@@ -1,0 +1,54 @@
+seed: 0
+eval_only: false
+dtype: single
+data:
+  problem_dim: 1
+  memory: 0
+  normalization: minmax
+network:
+  depth: 3
+  width: 20
+  critic_depth: 4
+  critic_width: 128
+  activation: gelu
+  latent_dim: 1
+  condition_on_state: true
+  det_arch: gated_resnet
+training:
+  device: cpu
+  valid: 0
+  epochs: 1000
+  batch_size: 256
+  optimizer: adam
+  scheduler: cosine
+  learning_rate: 0.001
+  verbose: 50
+  loss: mse
+  use_oracle_det: false
+  phase1_single_step: false
+  save_path: ./det_model
+gan:
+  epochs: 2000
+  batch_size: 1000
+  n_critic: 5
+  gp_lambda: 10
+  reuse_fake: true
+  gp_mode: pair
+  increment_scale: auto
+  single_step_critic: false
+  optimizer: adam
+  learning_rate: 5.0e-05
+  lr_decay: true
+  lr_min: 1.0e-05
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  verbose: 100
+  checkpoint_interval: 100
+  selection_std_weight: 1.0
+  selection_wgap_weight: 1.0
+  selection_gp_weight: 1.0
+  selection_mean_weight: 1.0
+  mmd_lambda: 1.0
+  center_generator: true
+  center_K: 16
+  save_path: ./gan_model

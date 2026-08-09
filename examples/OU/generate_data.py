@@ -2,8 +2,8 @@
 Data generation for the Ornstein-Uhlenbeck (OU) process.
 
 Follows Section 5.1.1 of:
-  Chen & Xiu (2024), "Learning stochastic flow map from data",
-  J. Comput. Phys., 514, 113218.
+  Chen & Xiu (2024), "Learning stochastic dynamical system via flow map operator",
+  J. Comput. Phys., 508, 112984.
 
 SDE:  dx = theta*(mu - x)*dt + sigma*dW
 Parameters: theta=1.0, mu=1.2, sigma=0.3
@@ -51,7 +51,7 @@ N_TEST        = 10_000   # number of test trajectories from x0=1.5
 X0_TEST       = 1.5      # test initial condition (paper §5.1.1)
 STEPS_TEST    = 400      # E-M steps  (T=4.0 / dt=0.01)
 
-SEED = 0
+SEED = 1
 
 
 # Euler-Maruyama integrator

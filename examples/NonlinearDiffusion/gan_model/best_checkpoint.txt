@@ -1,0 +1,10 @@
+epoch: 100
+selection_score: 0.0508271895325
+increment_std_rel_error: 0.0403065476449
+increment_mean_abs_error: 0.000624412563653
+wasserstein_gap: -0.00946209430695
+gradient_penalty: 0.000434135016985
+real_increment_std: 0.0494018483907
+fake_increment_std: 0.0474106304348
+generator_path: ./gan_model/checkpoints/generator_epoch_00100
+critic_path: ./gan_model/checkpoints/critic_epoch_00100

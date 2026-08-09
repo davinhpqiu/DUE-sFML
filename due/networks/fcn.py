@@ -149,6 +149,37 @@ class resnet(affine):
     def forward(self, x):
         return self.mlp(x) + x[...,-self.output_dim:]
 
+class gated_resnet(affine):
+    """
+    Gated ResNet: D(x) = Affine(x) + sigmoid(alpha) * mlp(x)
+
+    The learned affine map handles the dominant linear dynamics. The scalar
+    gate alpha is initialised to -10 so sigmoid(alpha) ≈ 0 at the start —
+    the network begins as a pure affine map and opens the MLP branch only
+    as training finds nonlinear structure in the data. For a linear SDE
+    (e.g. OU), alpha stays small and the fixed point is set by the affine
+    weights rather than by NN extrapolation in the sparse tail.
+
+    Professor's suggestion: 甚至加一个gating参数 (alpha is a trainable scalar,
+    initialised to -10).
+    """
+    def __init__(self, vmin, vmax, config):
+        super().__init__(vmin, vmax, config)
+        self.mlp = mlp(config)
+        # sigmoid(-10) ≈ 4.5e-5 ≈ 0: MLP branch starts off
+        init_val = torch.tensor(-10.0)
+        if self.dtype == "single":
+            init_val = init_val.float()
+        self.alpha = torch.nn.Parameter(init_val)
+        # Zero-init the affine correction so the map starts as pure identity
+        torch.nn.init.zeros_(self.mDMD.weight)
+        torch.nn.init.zeros_(self.mDMD.bias)
+
+    def forward(self, x):
+        # D(x) = x  +  learned_affine_correction(x)  +  sigmoid(alpha) * mlp(x)
+        # Starts as identity; affine learns the drift correction; MLP gate opens for nonlinearity
+        return x[..., -self.output_dim:] + self.mDMD(x) + torch.sigmoid(self.alpha) * self.mlp(x)
+
 class gresnet(affine):
     """
     Generalized ResNet built upon a given prior model and a feedforward neural network
